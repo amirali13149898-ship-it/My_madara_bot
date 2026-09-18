@@ -2,6 +2,7 @@ import os
 import json
 import time
 import asyncio
+import hashlib
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
@@ -19,13 +20,19 @@ STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
 API_GENRES = "https://manhwahub-tau.vercel.app/api/genres"
 API_CHAPTERS = "https://manhwahub-tau.vercel.app/api/chapters?manhwa_id={}"
-SITE_ROOT = "https://manhwahub-tau.vercel.app/"  # لینک خام صفحه اصلی سایت
+SITE_ROOT = "https://manhwahub-tau.vercel.app/"
+ARCHIVE_URL = "https://manhwahub-tau.vercel.app/manhwas"
+
+# وقت ایران (برای انتخاب "یک روز خاص")
+TEHRAN = timezone(timedelta(hours=3, minutes=30))
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Manhwa Hub Bot is running ✅", 200
+
+# ================== ابزارهای کمکی ==================
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -40,6 +47,11 @@ def save_state(state):
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_IDS
 
+def fetch_manhwas():
+    r = requests.get(API_MANHWAS, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
 def get_genres_map():
     r = requests.get(API_GENRES, timeout=15)
     r.raise_for_status()
@@ -50,8 +62,24 @@ def get_chapters(manhwa_id):
         r = requests.get(API_CHAPTERS.format(manhwa_id), timeout=12)
         r.raise_for_status()
         return r.json()
-    except:
+    except Exception:
         return []
+
+def get_max_chapter(manhwa_id):
+    chapters = get_chapters(manhwa_id)
+    return max([c.get("chapter_number", 0) for c in chapters], default=0)
+
+def parse_dt(s: str) -> datetime:
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def fingerprint(m: dict) -> str:
+    """اثر انگشت مشخصات مانهوا؛ اگه چیزی از این فیلدها عوض بشه یعنی مانهوا تغییر کرده."""
+    keys = ["title", "english_title", "rating", "status", "summary", "cover_url", "genre_ids"]
+    raw = json.dumps({k: m.get(k) for k in keys}, ensure_ascii=False, sort_keys=True)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 def make_hashtag(text: str) -> str:
     if not text or text == "—":
@@ -66,21 +94,18 @@ def format_caption(m, genres_map, chapter_count=None):
     status = m.get("status", "—")
     summary = (m.get("summary") or "—").strip()
 
-    # === تغییر ۱: لینک متنی داخل کپشن حالا همیشه لینک خام صفحه اصلی سایت است ===
-    link = SITE_ROOT
-
     genre_names = [genres_map.get(gid, "") for gid in m.get("genre_ids", [])]
     genre_names = [g for g in genre_names if g]
     genres_str = " ".join([f"#{g.replace(' ', '_')}" for g in genre_names]) if genre_names else "—"
 
     if chapter_count is None:
-        chapters = get_chapters(m["id"])
-        chapter_count = max([c.get("chapter_number", 0) for c in chapters], default=0)
+        chapter_count = get_max_chapter(m["id"])
 
     chapter_line = f"𓆩 chapter 01_{chapter_count:02d}🔚" if chapter_count > 0 else "𓆩 chapter 01_01🔚"
     fa_tag = make_hashtag(fa_title)
     en_tag = make_hashtag(en_title)
 
+    # لینک خام از کپشن حذف شد؛ حالا دکمه «بازکردن سایت» جاشو گرفته
     caption = f"""👤اسم فارسی مانهوا : {fa_title}
 👤 اسم انگلیسی مانهوا : {en_title}
 ⛓ژانر ها : {genres_str}
@@ -92,20 +117,28 @@ def format_caption(m, genres_map, chapter_count=None):
 
 {chapter_line}
 
-{link}
-
 🗣️@Manhwa_Hub_News
 {en_tag}"""
     return caption
 
 def make_keyboard(slug: str):
-    # دکمه شیشه‌ای همچنان به صفحه‌ی اختصاصی همون مانهوا لینک می‌شه
-    url = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
+    """ردیف اول: بازکردن سایت | ردیف دوم: مشاهده مانهوا + آرشیو کنار هم"""
+    url = f"{SITE_ROOT}manhwa/{slug}"
     keyboard = [
-        [InlineKeyboardButton("📖 مشاهده مانهوا", url=url)],
-        [InlineKeyboardButton("📚 آرشیو مانهواها", url="https://manhwahub-tau.vercel.app/manhwas")]
+        [InlineKeyboardButton("🌐 بازکردن سایت", url=SITE_ROOT)],
+        [
+            InlineKeyboardButton("📖 مشاهده مانهوا", url=url),
+            InlineKeyboardButton("📚 آرشیو مانهواها", url=ARCHIVE_URL),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+def make_notify_keyboard(m: dict):
+    """کیبورد پیام اطلاع‌رسانی: ادمین با زدن دکمه اول مشخصات کامل رو می‌گیره."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 دریافت مشخصات", callback_data=f"info_{m['id']}")],
+        [InlineKeyboardButton("📖 مشاهده مانهوا", url=f"{SITE_ROOT}manhwa/{m['slug']}")],
+    ])
 
 async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter_count=None):
     caption = format_caption(m, genres_map, chapter_count)
@@ -121,19 +154,65 @@ async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter
         print(f"خطا در ارسال {m['title']}: {e}")
         await bot.send_message(chat_id=chat_id, text=caption, reply_markup=keyboard)
 
+async def send_list(bot: Bot, chat_id: int, items: list):
+    if not items:
+        await bot.send_message(chat_id, "هیچ مانهوایی در این بازه پیدا نشد.")
+        return
+
+    genres_map = await asyncio.to_thread(get_genres_map)
+    await bot.send_message(chat_id, f"پیدا شد: {len(items)} مانهوا\nشروع ارسال...")
+
+    for m in items:
+        ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
+        await send_manhwa(bot, chat_id, m, genres_map, ch_count)
+        await asyncio.sleep(1.5)
+
+    await bot.send_message(chat_id, "✅ ارسال تمام شد.")
+
+# ================== منوها ==================
+
+def history_keyboard() -> InlineKeyboardMarkup:
+    b = InlineKeyboardButton
+    return InlineKeyboardMarkup([
+        [b("۱ روز پیش", callback_data="hist_1d"), b("۲ روز پیش", callback_data="hist_2d")],
+        [b("۱ هفته پیش", callback_data="hist_7d"), b("۱ ماه پیش", callback_data="hist_30d")],
+        [b("۳ ماه پیش", callback_data="hist_90d"), b("۶ ماه پیش", callback_data="hist_180d")],
+        [b("۱ سال پیش", callback_data="hist_365d")],
+        [b("📅 یک روز خاص", callback_data="pickday")],
+        [b("📚 همه مانهواها", callback_data="hist_all")],
+    ])
+
 # ================== دستورات ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("شما مجاز به استفاده از این بات نیستید.")
         return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ نه", callback_data="start_no"),
+        InlineKeyboardButton("✅ آره", callback_data="start_yes"),
+    ]])
     await update.message.reply_text(
-        "سلام! بات مانهوا هاب فعاله ✅\n\n"
-        "دستورات:\n"
-        "/history - مانهواهای قدیمی بر اساس بازه زمانی\n"
-        "/status - وضعیت بات\n"
-        "/help - راهنما"
+        "چطوری ارباب 👑\nمی‌خوای مانهواهایی که تا الان اومدن رو دریافت کنی؟",
+        reply_markup=keyboard,
     )
+
+async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(query.from_user.id):
+        return
+
+    if query.data == "start_no":
+        await query.edit_message_text(
+            "باشه ارباب 🙏\nهر مانهوا یا چپتر جدیدی که بیاد همون لحظه خبرت می‌کنم."
+        )
+    else:  # start_yes یا menu_back
+        await query.edit_message_text(
+            "کدوم بازه‌ی زمانی رو می‌خوای؟",
+            reply_markup=history_keyboard(),
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
@@ -142,7 +221,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 راهنما:\n\n"
         "/history → انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
         "/status → آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
-        "بات هر ۵ دقیقه به صورت خودکار مانهوای جدید و چپتر جدید رو برات می‌فرسته."
+        "بات هر ۵ دقیقه چک می‌کنه و اگه مانهوای جدید، چپتر جدید یا تغییری باشه بهت خبر می‌ده. "
+        "با دکمه «📩 دریافت مشخصات» می‌تونی مشخصات کامل اون مانهوا رو بگیری."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,17 +241,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
-
-    keyboard = [
-        [InlineKeyboardButton("۱ روز پیش", callback_data="hist_1d"),
-         InlineKeyboardButton("۲ روز پیش", callback_data="hist_2d")],
-        [InlineKeyboardButton("۱ هفته پیش", callback_data="hist_7d"),
-         InlineKeyboardButton("۱ ماه پیش", callback_data="hist_30d")],
-        [InlineKeyboardButton("۳ ماه پیش", callback_data="hist_90d"),
-         InlineKeyboardButton("۶ ماه پیش", callback_data="hist_180d")],
-        [InlineKeyboardButton("۱ سال پیش", callback_data="hist_365d")]
-    ]
-    await update.message.reply_text("کدام بازه زمانی رو می‌خوای؟", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("کدوم بازه‌ی زمانی رو می‌خوای؟", reply_markup=history_keyboard())
 
 async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -181,52 +251,116 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     days_map = {
         "hist_1d": 1, "hist_2d": 2, "hist_7d": 7,
-        "hist_30d": 30, "hist_90d": 90, "hist_180d": 180, "hist_365d": 365
+        "hist_30d": 30, "hist_90d": 90, "hist_180d": 180, "hist_365d": 365,
     }
-    days = days_map.get(query.data)
-    if not days:
-        return
 
-    await query.edit_message_text(f"در حال پیدا کردن مانهواهای {days} روز گذشته...")
+    if query.data == "hist_all":
+        days = None
+        label = "همه‌ی مانهواها"
+    else:
+        days = days_map.get(query.data)
+        if not days:
+            return
+        label = f"مانهواهای {days} روز گذشته"
+
+    await query.edit_message_text(f"در حال پیدا کردن {label}...")
 
     try:
-        r = requests.get(API_MANHWAS, timeout=20)
-        r.raise_for_status()
-        manhwas = r.json()
-        genres_map = get_genres_map()
+        manhwas = await asyncio.to_thread(fetch_manhwas)
+        if days:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            items = [m for m in manhwas if parse_dt(m["created_at"]) >= cutoff]
+        else:
+            items = list(manhwas)
+        items.sort(key=lambda x: parse_dt(x["created_at"]), reverse=True)
+        await send_list(context.bot, query.from_user.id, items)
+    except Exception as e:
+        await context.bot.send_message(query.from_user.id, f"خطا: {e}")
 
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=days)
+async def pickday_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(query.from_user.id):
+        return
 
-        filtered = [m for m in manhwas if datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")) >= cutoff]
-        filtered.sort(key=lambda x: x["created_at"], reverse=True)
+    today = datetime.now(TEHRAN).date()
+    rows, row = [], []
+    for i in range(14):
+        d = today - timedelta(days=i)
+        label = "امروز" if i == 0 else "دیروز" if i == 1 else d.strftime("%m/%d")
+        row.append(InlineKeyboardButton(label, callback_data=f"day_{d.isoformat()}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="menu_back")])
 
-        if not filtered:
-            await context.bot.send_message(query.from_user.id, "هیچ مانهوایی در این بازه پیدا نشد.")
+    await query.edit_message_text(
+        "کدوم روز؟ (۱۴ روز اخیر، به وقت ایران)",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+async def day_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(query.from_user.id):
+        return
+
+    try:
+        day = datetime.strptime(query.data[4:], "%Y-%m-%d").date()
+    except ValueError:
+        return
+
+    await query.edit_message_text(f"در حال پیدا کردن مانهواهای {day.isoformat()}...")
+
+    try:
+        manhwas = await asyncio.to_thread(fetch_manhwas)
+        items = [m for m in manhwas if parse_dt(m["created_at"]).astimezone(TEHRAN).date() == day]
+        items.sort(key=lambda x: parse_dt(x["created_at"]), reverse=True)
+        await send_list(context.bot, query.from_user.id, items)
+    except Exception as e:
+        await context.bot.send_message(query.from_user.id, f"خطا: {e}")
+
+async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دکمه «📩 دریافت مشخصات» زیر پیام‌های اطلاع‌رسانی."""
+    query = update.callback_query
+    if not is_allowed(query.from_user.id):
+        await query.answer()
+        return
+    await query.answer("در حال ارسال مشخصات...")
+
+    mid = query.data[5:]
+    try:
+        manhwas = await asyncio.to_thread(fetch_manhwas)
+        m = next((x for x in manhwas if str(x["id"]) == mid), None)
+        if not m:
+            await context.bot.send_message(query.from_user.id, "این مانهوا دیگه پیدا نشد.")
             return
-
-        await context.bot.send_message(query.from_user.id, f"پیدا شد: {len(filtered)} مانهوا\nشروع ارسال...")
-
-        for m in filtered:
-            chapters = get_chapters(m["id"])
-            ch_count = max([c.get("chapter_number", 0) for c in chapters], default=0)
-            await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count)
-            time.sleep(1.5)
-
-        await context.bot.send_message(query.from_user.id, "✅ ارسال تمام شد.")
+        genres_map = await asyncio.to_thread(get_genres_map)
+        ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
+        await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count)
     except Exception as e:
         await context.bot.send_message(query.from_user.id, f"خطا: {e}")
 
 # ================== چک خودکار (بدون JobQueue) ==================
 
-def check_loop(application: Application):
-    """این تابع تو یه ترد جداگانه اجرا می‌شه و هر چند دقیقه چک می‌کنه.
-    یک event loop اختصاصی برای خودش می‌سازه تا با لوپ پولینگ بات تداخل نکنه."""
-    bot = application.bot
+def check_loop():
+    """تو یه ترد جدا اجرا می‌شه. لوپ و Bot اختصاصی خودش رو داره تا با پولینگ تداخل نکنه.
+    فقط اطلاع می‌ده؛ مشخصات کامل با دکمه‌ی «دریافت مشخصات» فرستاده می‌شه."""
     print("حلقه چک خودکار شروع شد...")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    bot = Bot(BOT_TOKEN)
+
+    def notify(text, m):
+        kb = make_notify_keyboard(m)
+        for uid in ALLOWED_IDS:
+            try:
+                loop.run_until_complete(bot.send_message(uid, text, reply_markup=kb))
+            except Exception as e:
+                print(f"خطا در اطلاع‌رسانی به {uid}: {e}")
 
     while True:
         try:
@@ -236,31 +370,37 @@ def check_loop(application: Application):
 
             state = load_state()
             known = state.get("known_manhwas", {})
-            genres_map = get_genres_map()
+            first_run = not known  # اولین اجرا: فقط ثبت می‌کنیم، اسپم نمی‌کنیم
 
-            r = requests.get(API_MANHWAS, timeout=20)
-            r.raise_for_status()
-            manhwas = r.json()
+            manhwas = fetch_manhwas()
 
             for m in manhwas:
                 mid = str(m["id"])
-                chapters = get_chapters(m["id"])
-                current_ch = max([c.get("chapter_number", 0) for c in chapters], default=0)
+                fp = fingerprint(m)
+                current_ch = get_max_chapter(m["id"])
+                entry = known.get(mid)
 
-                if mid not in known:
-                    print(f"مانهوای جدید: {m['title']}")
-                    for uid in ALLOWED_IDS:
-                        loop.run_until_complete(send_manhwa(bot, uid, m, genres_map, current_ch))
-                    known[mid] = current_ch
+                # سازگاری با state.json قدیمی (که فقط عدد چپتر بود)
+                if isinstance(entry, int):
+                    entry = {"ch": entry, "fp": fp}
+                    known[mid] = entry
+
+                if entry is None:
+                    known[mid] = {"ch": current_ch, "fp": fp}
+                    if not first_run:
+                        print(f"مانهوای جدید: {m['title']}")
+                        en = m.get("english_title") or ""
+                        notify(f"🆕 مانهوای جدید اضافه شد!\n\n{m['title']}\n{en}".strip(), m)
                 else:
-                    last_ch = known[mid]
+                    last_ch = entry["ch"]
                     if current_ch > last_ch:
                         print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
-                        text = f"🆕 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}"
-                        keyboard = make_keyboard(m["slug"])
-                        for uid in ALLOWED_IDS:
-                            loop.run_until_complete(bot.send_message(uid, text, reply_markup=keyboard))
-                        known[mid] = current_ch
+                        notify(f"🔔 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}", m)
+                    elif fp != entry.get("fp"):
+                        print(f"مشخصات تغییر کرد: {m['title']}")
+                        notify(f"✏️ مشخصات این مانهوا تغییر کرده:\n\n{m['title']}", m)
+                    # اگه دریافت چپترها خطا داد (۰ برگشت)، عدد قبلی حفظ می‌شه
+                    known[mid] = {"ch": max(current_ch, last_ch), "fp": fp}
 
             state["known_manhwas"] = known
             state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -275,25 +415,26 @@ def check_loop(application: Application):
 # ================== اجرا ==================
 
 def run_bot():
-    """پولینگ بات رو تو یه لوپ بی‌نهایت اجرا می‌کنه و اگه به هر دلیلی کرش کرد
-    (که علت اصلیِ 'دیگه به /start جواب نمیده' همینه)، خودکار دوباره راهش می‌ندازه."""
+    """پولینگ بات رو تو یه لوپ بی‌نهایت اجرا می‌کنه و اگه کرش کرد خودکار دوباره راه می‌ندازه."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("history", history))
-    application.add_handler(CallbackQueryHandler(history_callback, pattern="^hist_"))
 
-    checker_thread = threading.Thread(target=check_loop, args=(application,), daemon=True)
+    application.add_handler(CallbackQueryHandler(start_callback, pattern=r"^(start_yes|start_no|menu_back)$"))
+    application.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist_(\d+d|all)$"))
+    application.add_handler(CallbackQueryHandler(pickday_callback, pattern=r"^pickday$"))
+    application.add_handler(CallbackQueryHandler(day_callback, pattern=r"^day_"))
+    application.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info_"))
+
+    checker_thread = threading.Thread(target=check_loop, daemon=True)
     checker_thread.start()
 
     while True:
         try:
-            # === تغییر ۲: چون run_polling تو یه ترد فرعی اجرا می‌شه (نه ترد اصلی)،
-            # نباید سعی کنه signal handler رجیستر کنه؛ وگرنه با یه خطای بی‌صدا
-            # لوپ می‌میره و دیگه به هیچ دستوری (از جمله /start) جواب نمی‌ده.
-            # stop_signals=None این مشکل رو حل می‌کنه.
+            # run_polling تو ترد فرعی اجرا می‌شه، پس signal handler نباید رجیستر بشه
             application.run_polling(drop_pending_updates=True, stop_signals=None)
         except Exception as e:
             print("پولینگ بات کرش کرد، ۵ ثانیه دیگه دوباره تلاش می‌کنیم:", e)
@@ -308,7 +449,6 @@ def main():
     run_bot()
 
 if __name__ == "__main__":
-    # Flask رو تو ترد اصلی اجرا می‌کنیم
     bot_thread = threading.Thread(target=main, daemon=True)
     bot_thread.start()
 
