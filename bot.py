@@ -414,8 +414,7 @@ def check_loop():
 
 # ================== اجرا ==================
 
-def run_bot():
-    """پولینگ بات رو تو یه لوپ بی‌نهایت اجرا می‌کنه و اگه کرش کرد خودکار دوباره راه می‌ندازه."""
+def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -428,29 +427,36 @@ def run_bot():
     application.add_handler(CallbackQueryHandler(pickday_callback, pattern=r"^pickday$"))
     application.add_handler(CallbackQueryHandler(day_callback, pattern=r"^day_"))
     application.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info_"))
+    return application
 
-    checker_thread = threading.Thread(target=check_loop, daemon=True)
-    checker_thread.start()
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
+
+def run_bot():
+    """پولینگ حتماً باید روی ترد اصلی اجرا بشه؛ python-telegram-bot تو ترد فرعی
+    event loop نداره و پولینگ اصلاً بالا نمیاد (نتیجه: نه /start جواب می‌ده نه دکمه‌ها)."""
+    threading.Thread(target=check_loop, daemon=True).start()
 
     while True:
         try:
-            # run_polling تو ترد فرعی اجرا می‌شه، پس signal handler نباید رجیستر بشه
-            application.run_polling(drop_pending_updates=True, stop_signals=None)
+            # هر بار لوپ و Application تازه، چون run_polling در پایان لوپ رو می‌بنده
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            application = build_application()
+            application.run_polling(drop_pending_updates=True)
+            break  # اگه عادی تموم شد (مثلاً سیگنال توقف)، از حلقه خارج شو
         except Exception as e:
             print("پولینگ بات کرش کرد، ۵ ثانیه دیگه دوباره تلاش می‌کنیم:", e)
             time.sleep(5)
 
-def main():
+if __name__ == "__main__":
+    # Flask تو ترد فرعی، بات (پولینگ) تو ترد اصلی
+    threading.Thread(target=run_flask, daemon=True).start()
+    print(f"Flask در حال اجرا روی پورت {PORT}...")
+
     if not BOT_TOKEN or not ALLOWED_IDS:
         print("❌ BOT_TOKEN یا ALLOWED_IDS تنظیم نشده!")
-        return
-
-    print(f"بات شروع شد | آیدی‌های مجاز: {ALLOWED_IDS}")
-    run_bot()
-
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=main, daemon=True)
-    bot_thread.start()
-
-    print(f"Flask در حال اجرا روی پورت {PORT}...")
-    app.run(host="0.0.0.0", port=PORT)
+        while True:
+            time.sleep(3600)  # سرور زنده بمونه تا لاگ‌ها دیده بشن
+    else:
+        print(f"بات شروع شد | آیدی‌های مجاز: {ALLOWED_IDS}")
+        run_bot()
