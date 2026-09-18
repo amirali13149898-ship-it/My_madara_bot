@@ -18,6 +18,7 @@ STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
 API_GENRES = "https://manhwahub-tau.vercel.app/api/genres"
 API_CHAPTERS = "https://manhwahub-tau.vercel.app/api/chapters?manhwa_id={}"
+SITE_URL = "https://manhwahub-tau.vercel.app/"
 
 app = Flask(__name__)
 
@@ -64,7 +65,6 @@ def format_caption(m, genres_map, chapter_count=None):
     status = m.get("status", "—")
     summary = (m.get("summary") or "—").strip()
     slug = m["slug"]
-    link = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
 
     genre_names = [genres_map.get(gid, "") for gid in m.get("genre_ids", [])]
     genre_names = [g for g in genre_names if g]
@@ -78,6 +78,7 @@ def format_caption(m, genres_map, chapter_count=None):
     fa_tag = make_hashtag(fa_title)
     en_tag = make_hashtag(en_title)
 
+    # لینک اصلی سایت (نه لینک مانهوا)
     caption = f"""👤اسم فارسی مانهوا : {fa_title}
 👤 اسم انگلیسی مانهوا : {en_title}
 ⛓ژانر ها : {genres_str}
@@ -89,17 +90,17 @@ def format_caption(m, genres_map, chapter_count=None):
 
 {chapter_line}
 
-{link}
+{SITE_URL}
 
 🗣️@Manhwa_Hub_News
 {en_tag}"""
     return caption
 
 def make_keyboard(slug: str):
-    url = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
+    manhwa_url = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
     keyboard = [
-        [InlineKeyboardButton("📖 مشاهده مانهوا", url=url)],
-        [InlineKeyboardButton("📚 آرشیو مانهواها", url="https://manhwahub-tau.vercel.app/manhwas")]
+        [InlineKeyboardButton("📖 مشاهده مانهوا", url=manhwa_url)],
+        [InlineKeyboardButton("🏠 صفحه اصلی سایت", url=SITE_URL)]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -120,15 +121,18 @@ async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter
 # ================== دستورات ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
         await update.message.reply_text("شما مجاز به استفاده از این بات نیستید.")
         return
+
     await update.message.reply_text(
         "سلام! بات مانهوا هاب فعاله ✅\n\n"
-        "دستورات:\n"
+        "دستورات موجود:\n"
         "/history - مانهواهای قدیمی بر اساس بازه زمانی\n"
         "/status - وضعیت بات\n"
-        "/help - راهنما"
+        "/help - راهنما\n\n"
+        "بات هر ۵ دقیقه مانهوای جدید و چپتر جدید رو برات می‌فرسته."
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,9 +140,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📖 راهنما:\n\n"
-        "/history → انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
-        "/status → آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
-        "بات هر ۵ دقیقه به صورت خودکار مانهوای جدید و چپتر جدید رو برات می‌فرسته."
+        "/start - فعال‌سازی و خوش‌آمدگویی\n"
+        "/history - انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
+        "/status - آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
+        "بات به صورت خودکار هر ۵ دقیقه سایت رو چک می‌کنه."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,13 +218,10 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await context.bot.send_message(query.from_user.id, f"خطا: {e}")
 
-# ================== چک خودکار (بدون JobQueue) ==================
+# ================== چک خودکار ==================
 
-def check_loop(application: Application):
-    """این تابع تو یه ترد جداگانه اجرا می‌شه و هر چند دقیقه چک می‌کنه"""
-    bot = application.bot
+def check_loop(bot: Bot):
     print("حلقه چک خودکار شروع شد...")
-
     while True:
         try:
             if not ALLOWED_IDS:
@@ -234,6 +236,10 @@ def check_loop(application: Application):
             r.raise_for_status()
             manhwas = r.json()
 
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
             for m in manhwas:
                 mid = str(m["id"])
                 chapters = get_chapters(m["id"])
@@ -241,26 +247,24 @@ def check_loop(application: Application):
 
                 if mid not in known:
                     print(f"مانهوای جدید: {m['title']}")
-                    # چون تو ترد عادی هستیم، از asyncio استفاده می‌کنیم
-                    import asyncio
                     for uid in ALLOWED_IDS:
-                        asyncio.run(send_manhwa(bot, uid, m, genres_map, current_ch))
+                        loop.run_until_complete(send_manhwa(bot, uid, m, genres_map, current_ch))
                     known[mid] = current_ch
                 else:
-                    last_ch = known[mid]
+                    last_ch = known.get(mid, 0)
                     if current_ch > last_ch:
                         print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
                         text = f"🆕 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}"
                         keyboard = make_keyboard(m["slug"])
-                        import asyncio
                         for uid in ALLOWED_IDS:
-                            asyncio.run(bot.send_message(uid, text, reply_markup=keyboard))
+                            loop.run_until_complete(bot.send_message(uid, text, reply_markup=keyboard))
                         known[mid] = current_ch
 
             state["known_manhwas"] = known
             state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             save_state(state)
             print("چک انجام شد.")
+            loop.close()
 
         except Exception as e:
             print("خطا در چک خودکار:", e)
@@ -269,7 +273,7 @@ def check_loop(application: Application):
 
 # ================== اجرا ==================
 
-def main():
+def run_bot():
     if not BOT_TOKEN or not ALLOWED_IDS:
         print("❌ BOT_TOKEN یا ALLOWED_IDS تنظیم نشده!")
         return
@@ -284,17 +288,21 @@ def main():
     application.add_handler(CommandHandler("history", history))
     application.add_handler(CallbackQueryHandler(history_callback, pattern="^hist_"))
 
-    # شروع حلقه چک تو یه ترد جدا
-    checker_thread = threading.Thread(target=check_loop, args=(application,), daemon=True)
-    checker_thread.start()
+    # شروع حلقه چک
+    checker = threading.Thread(target=check_loop, args=(application.bot,), daemon=True)
+    checker.start()
 
-    # شروع polling بات
+    # اجرای بات
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    # Flask رو تو ترد اصلی اجرا می‌کنیم
-    bot_thread = threading.Thread(target=main, daemon=True)
-    bot_thread.start()
+    # Flask در ترد جدا
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False),
+        daemon=True
+    )
+    flask_thread.start()
+    print(f"Flask روی پورت {PORT} اجرا شد")
 
-    print(f"Flask در حال اجرا روی پورت {PORT}...")
-    app.run(host="0.0.0.0", port=PORT)
+    # بات در ترد اصلی
+    run_bot()
