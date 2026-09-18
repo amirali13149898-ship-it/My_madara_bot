@@ -16,6 +16,11 @@ ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") i
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 PORT = int(os.getenv("PORT", 10000))
 
+# کانالی که پست‌ها بعد از تأیید بهش فرستاده می‌شن.
+# می‌تونه یوزرنیم کانال باشه (@Manhwa_Hub_News) یا آیدی عددی (-100123...)
+_raw_channel = os.getenv("CHANNEL_ID", "@Manhwa_Hub_News").strip()
+CHANNEL_ID = int(_raw_channel) if _raw_channel.lstrip("-").isdigit() else _raw_channel
+
 STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
 API_GENRES = "https://manhwahub-tau.vercel.app/api/genres"
@@ -133,6 +138,12 @@ def make_keyboard(slug: str):
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def make_preview_keyboard(m: dict):
+    """کیبورد نسخه‌ی پیش‌نمایش (فقط برای ادمین): دکمه‌های اصلی پست + دکمه‌ی تأیید و ارسال به کانال."""
+    rows = [list(r) for r in make_keyboard(m["slug"]).inline_keyboard]
+    rows.append([InlineKeyboardButton("📢 ارسال به کانال", callback_data=f"pub_{m['id']}")])
+    return InlineKeyboardMarkup(rows)
+
 def make_notify_keyboard(m: dict):
     """کیبورد پیام اطلاع‌رسانی: ادمین با زدن دکمه اول مشخصات کامل رو می‌گیره."""
     return InlineKeyboardMarkup([
@@ -140,9 +151,11 @@ def make_notify_keyboard(m: dict):
         [InlineKeyboardButton("📖 مشاهده مانهوا", url=f"{SITE_ROOT}manhwa/{m['slug']}")],
     ])
 
-async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter_count=None):
+async def send_manhwa(bot: Bot, chat_id, m: dict, genres_map: dict, chapter_count=None, preview=False):
+    """preview=True → نسخه‌ی پیش‌نمایش برای ادمین (با دکمه‌ی ارسال به کانال).
+    preview=False → نسخه‌ی نهایی که تو کانال قرار می‌گیره (فقط دکمه‌های اصلی)."""
     caption = format_caption(m, genres_map, chapter_count)
-    keyboard = make_keyboard(m["slug"])
+    keyboard = make_preview_keyboard(m) if preview else make_keyboard(m["slug"])
     cover = m.get("cover_url")
 
     try:
@@ -164,7 +177,7 @@ async def send_list(bot: Bot, chat_id: int, items: list):
 
     for m in items:
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
-        await send_manhwa(bot, chat_id, m, genres_map, ch_count)
+        await send_manhwa(bot, chat_id, m, genres_map, ch_count, preview=True)
         await asyncio.sleep(1.5)
 
     await bot.send_message(chat_id, "✅ ارسال تمام شد.")
@@ -180,6 +193,7 @@ def history_keyboard() -> InlineKeyboardMarkup:
         [b("۱ سال پیش", callback_data="hist_365d")],
         [b("📅 یک روز خاص", callback_data="pickday")],
         [b("📚 همه مانهواها", callback_data="hist_all")],
+        [b("🗂 انتخاب از آرشیو (یکی‌یکی)", callback_data="arcp_0")],
     ])
 
 # ================== دستورات ==================
@@ -220,9 +234,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 راهنما:\n\n"
         "/history → انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
+        "/archive → لیست همه‌ی مانهواها (صفحه‌بندی‌شده) و انتخاب یکی‌یکی\n"
+        "/search اسم → جستجوی مانهوا با اسم فارسی یا انگلیسی\n"
         "/status → آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
         "بات هر ۵ دقیقه چک می‌کنه و اگه مانهوای جدید، چپتر جدید یا تغییری باشه بهت خبر می‌ده. "
-        "با دکمه «📩 دریافت مشخصات» می‌تونی مشخصات کامل اون مانهوا رو بگیری."
+        "با دکمه «📩 دریافت مشخصات» می‌تونی مشخصات کامل اون مانهوا رو بگیری.\n\n"
+        "هر مانهوایی که برات میاد یه پیش‌نمایشه؛ اگه خوب بود با دکمه‌ی «📢 ارسال به کانال» "
+        "و بعد «✅ آره، بفرست» همون پست با دکمه‌های شیشه‌ای تو کانال منتشر می‌شه."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,9 +357,200 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         genres_map = await asyncio.to_thread(get_genres_map)
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
-        await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count)
+        await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count, preview=True)
     except Exception as e:
         await context.bot.send_message(query.from_user.id, f"خطا: {e}")
+
+def _keyboard_with_row(query, buttons: list) -> InlineKeyboardMarkup:
+    """کیبورد پیام فعلی رو نگه می‌داره و فقط ردیف آخر (ردیف کنترل) رو عوض می‌کنه."""
+    rows = [list(r) for r in query.message.reply_markup.inline_keyboard[:-1]]
+    rows.append(buttons)
+    return InlineKeyboardMarkup(rows)
+
+def _send_button(mid: str) -> list:
+    return [InlineKeyboardButton("📢 ارسال به کانال", callback_data=f"pub_{mid}")]
+
+async def ask_publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مرحله‌ی اول: دکمه «📢 ارسال به کانال» فقط ازت تأیید می‌گیره، هنوز چیزی تو کانال نمی‌ره."""
+    query = update.callback_query
+    if not is_allowed(query.from_user.id):
+        await query.answer()
+        return
+    if query.message is None or query.message.reply_markup is None:
+        await query.answer("این پیام دیگه در دسترس نیست.", show_alert=True)
+        return
+
+    published = context.bot_data.setdefault("published", set())
+    if (query.message.chat_id, query.message.message_id) in published:
+        await query.answer("این پست قبلاً به کانال فرستاده شده ✅", show_alert=True)
+        return
+
+    mid = query.data[4:]
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=_keyboard_with_row(query, [
+        InlineKeyboardButton("✅ آره، بفرست", callback_data=f"pubok_{mid}"),
+        InlineKeyboardButton("❌ لغو", callback_data=f"pubno_{mid}"),
+    ]))
+
+async def cancel_publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لغو: دکمه‌ی ارسال به حالت اول برمی‌گرده."""
+    query = update.callback_query
+    if not is_allowed(query.from_user.id):
+        await query.answer()
+        return
+    await query.answer("لغو شد.")
+    if query.message is None or query.message.reply_markup is None:
+        return
+    await query.edit_message_reply_markup(
+        reply_markup=_keyboard_with_row(query, _send_button(query.data[6:]))
+    )
+
+async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مرحله‌ی دوم (بعد از «✅ آره، بفرست»): پست نهایی مستقیم از طرف بات تو کانال ساخته می‌شه،
+    برای همین دکمه‌های شیشه‌ای سالم می‌مونن (برخلاف فوروارد)."""
+    query = update.callback_query
+    if not is_allowed(query.from_user.id):
+        await query.answer()
+        return
+    if query.message is None or query.message.reply_markup is None:
+        await query.answer("این پیام دیگه در دسترس نیست.", show_alert=True)
+        return
+
+    # جلوگیری از ارسال دوباره‌ی یه پیش‌نمایش (مثلاً دوبار کلیک)
+    published = context.bot_data.setdefault("published", set())
+    key = (query.message.chat_id, query.message.message_id)
+    if key in published:
+        await query.answer("این پست قبلاً به کانال فرستاده شده ✅", show_alert=True)
+        return
+
+    mid = query.data[6:]
+    await query.answer("در حال ارسال به کانال...")
+
+    try:
+        manhwas = await asyncio.to_thread(fetch_manhwas)
+        m = next((x for x in manhwas if str(x["id"]) == mid), None)
+        if not m:
+            await query.edit_message_reply_markup(
+                reply_markup=_keyboard_with_row(query, _send_button(mid))
+            )
+            await context.bot.send_message(query.from_user.id, "این مانهوا دیگه پیدا نشد.")
+            return
+        genres_map = await asyncio.to_thread(get_genres_map)
+        ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
+
+        # مشخصات از API تازه گرفته می‌شه؛ پس پست کانال همیشه آخرین اطلاعات رو داره
+        await send_manhwa(context.bot, CHANNEL_ID, m, genres_map, ch_count, preview=False)
+
+        published.add(key)
+        await query.edit_message_reply_markup(reply_markup=_keyboard_with_row(
+            query, [InlineKeyboardButton("✅ به کانال ارسال شد", callback_data="noop")]
+        ))
+    except Exception as e:
+        print(f"خطا در ارسال به کانال: {e}")
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_keyboard_with_row(query, _send_button(mid))
+            )
+        except Exception:
+            pass
+        await context.bot.send_message(
+            query.from_user.id,
+            f"❌ ارسال به کانال ناموفق بود:\n{e}\n\n"
+            "چک کن که بات تو کانال ادمین باشه و دسترسی «ارسال پیام» داشته باشه، "
+            f"و مقدار CHANNEL_ID درست باشه (الان: {CHANNEL_ID}).",
+        )
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
+# ================== آرشیو و جستجو ==================
+# دکمه‌ی هر مانهوا از همون callback «info_» استفاده می‌کنه؛ یعنی پیش‌نمایش (با دکمه‌ی ارسال به کانال) برات میاد.
+
+ARCHIVE_PAGE_SIZE = 8
+SEARCH_MAX_RESULTS = 15
+
+def _short(text: str, n: int = 38) -> str:
+    text = (text or "—").strip()
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+def _manhwa_button(m: dict) -> list:
+    return [InlineKeyboardButton(_short(m["title"]), callback_data=f"info_{m['id']}")]
+
+def archive_keyboard(items: list, page: int):
+    total_pages = max(1, (len(items) + ARCHIVE_PAGE_SIZE - 1) // ARCHIVE_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * ARCHIVE_PAGE_SIZE:(page + 1) * ARCHIVE_PAGE_SIZE]
+
+    rows = [_manhwa_button(m) for m in chunk]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"arcp_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"arcp_{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="menu_back")])
+    return InlineKeyboardMarkup(rows)
+
+def archive_text(count: int) -> str:
+    return (
+        f"🗂 آرشیو مانهواها ({count} تا، جدیدترین اول)\n"
+        "روی هر مانهوا بزنی پیش‌نمایشش میاد و از همون‌جا می‌تونی بفرستیش کانال."
+    )
+
+async def load_sorted_manhwas() -> list:
+    manhwas = await asyncio.to_thread(fetch_manhwas)
+    return sorted(manhwas, key=lambda x: parse_dt(x["created_at"]), reverse=True)
+
+async def archive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    try:
+        items = await load_sorted_manhwas()
+        await update.message.reply_text(archive_text(len(items)), reply_markup=archive_keyboard(items, 0))
+    except Exception as e:
+        await update.message.reply_text(f"خطا: {e}")
+
+async def archive_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(query.from_user.id):
+        return
+    try:
+        page = int(query.data[5:])
+        items = await load_sorted_manhwas()
+        await query.edit_message_text(archive_text(len(items)), reply_markup=archive_keyboard(items, page))
+    except Exception as e:
+        print(f"خطا در آرشیو: {e}")
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/search اسم مانهوا (فارسی یا انگلیسی، بخشی از اسم هم کافیه)"""
+    if not is_allowed(update.effective_user.id):
+        return
+    q = " ".join(context.args).strip().lower()
+    if not q:
+        await update.message.reply_text("اسم مانهوا رو بعد از دستور بنویس. مثلاً:\n/search solo leveling")
+        return
+    try:
+        items = await load_sorted_manhwas()
+        found = [
+            m for m in items
+            if q in (m.get("title") or "").lower() or q in (m.get("english_title") or "").lower()
+        ]
+        if not found:
+            await update.message.reply_text("چیزی پیدا نشد. یه بخش دیگه از اسم رو امتحان کن.")
+            return
+        extra = ""
+        if len(found) > SEARCH_MAX_RESULTS:
+            extra = f"\n(فقط {SEARCH_MAX_RESULTS} تای اول نمایش داده شد؛ جستجو رو دقیق‌تر کن)"
+            found = found[:SEARCH_MAX_RESULTS]
+        rows = [_manhwa_button(m) for m in found]
+        await update.message.reply_text(
+            f"🔎 {len(found)} نتیجه:{extra}\nروی هر کدوم بزنی پیش‌نمایشش میاد.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"خطا: {e}")
 
 # ================== چک خودکار (بدون JobQueue) ==================
 
@@ -421,12 +630,19 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("history", history))
+    application.add_handler(CommandHandler("archive", archive_cmd))
+    application.add_handler(CommandHandler("search", search_cmd))
 
     application.add_handler(CallbackQueryHandler(start_callback, pattern=r"^(start_yes|start_no|menu_back)$"))
     application.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist_(\d+d|all)$"))
     application.add_handler(CallbackQueryHandler(pickday_callback, pattern=r"^pickday$"))
+    application.add_handler(CallbackQueryHandler(archive_page_callback, pattern=r"^arcp_\d+$"))
     application.add_handler(CallbackQueryHandler(day_callback, pattern=r"^day_"))
     application.add_handler(CallbackQueryHandler(info_callback, pattern=r"^info_"))
+    application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub_"))
+    application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok_"))
+    application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno_"))
+    application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
     return application
 
 def run_flask():
