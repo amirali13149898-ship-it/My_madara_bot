@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import asyncio
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
@@ -18,7 +19,7 @@ STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
 API_GENRES = "https://manhwahub-tau.vercel.app/api/genres"
 API_CHAPTERS = "https://manhwahub-tau.vercel.app/api/chapters?manhwa_id={}"
-SITE_URL = "https://manhwahub-tau.vercel.app/"
+SITE_ROOT = "https://manhwahub-tau.vercel.app/"  # لینک خام صفحه اصلی سایت
 
 app = Flask(__name__)
 
@@ -64,7 +65,9 @@ def format_caption(m, genres_map, chapter_count=None):
     rating = m.get("rating", "—")
     status = m.get("status", "—")
     summary = (m.get("summary") or "—").strip()
-    slug = m["slug"]
+
+    # === تغییر ۱: لینک متنی داخل کپشن حالا همیشه لینک خام صفحه اصلی سایت است ===
+    link = SITE_ROOT
 
     genre_names = [genres_map.get(gid, "") for gid in m.get("genre_ids", [])]
     genre_names = [g for g in genre_names if g]
@@ -78,7 +81,6 @@ def format_caption(m, genres_map, chapter_count=None):
     fa_tag = make_hashtag(fa_title)
     en_tag = make_hashtag(en_title)
 
-    # لینک اصلی سایت (نه لینک مانهوا)
     caption = f"""👤اسم فارسی مانهوا : {fa_title}
 👤 اسم انگلیسی مانهوا : {en_title}
 ⛓ژانر ها : {genres_str}
@@ -90,17 +92,18 @@ def format_caption(m, genres_map, chapter_count=None):
 
 {chapter_line}
 
-{SITE_URL}
+{link}
 
 🗣️@Manhwa_Hub_News
 {en_tag}"""
     return caption
 
 def make_keyboard(slug: str):
-    manhwa_url = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
+    # دکمه شیشه‌ای همچنان به صفحه‌ی اختصاصی همون مانهوا لینک می‌شه
+    url = f"https://manhwahub-tau.vercel.app/manhwa/{slug}"
     keyboard = [
-        [InlineKeyboardButton("📖 مشاهده مانهوا", url=manhwa_url)],
-        [InlineKeyboardButton("🏠 صفحه اصلی سایت", url=SITE_URL)]
+        [InlineKeyboardButton("📖 مشاهده مانهوا", url=url)],
+        [InlineKeyboardButton("📚 آرشیو مانهواها", url="https://manhwahub-tau.vercel.app/manhwas")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -121,18 +124,15 @@ async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter
 # ================== دستورات ==================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_allowed(user_id):
+    if not is_allowed(update.effective_user.id):
         await update.message.reply_text("شما مجاز به استفاده از این بات نیستید.")
         return
-
     await update.message.reply_text(
         "سلام! بات مانهوا هاب فعاله ✅\n\n"
-        "دستورات موجود:\n"
+        "دستورات:\n"
         "/history - مانهواهای قدیمی بر اساس بازه زمانی\n"
         "/status - وضعیت بات\n"
-        "/help - راهنما\n\n"
-        "بات هر ۵ دقیقه مانهوای جدید و چپتر جدید رو برات می‌فرسته."
+        "/help - راهنما"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -140,10 +140,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "📖 راهنما:\n\n"
-        "/start - فعال‌سازی و خوش‌آمدگویی\n"
-        "/history - انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
-        "/status - آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
-        "بات به صورت خودکار هر ۵ دقیقه سایت رو چک می‌کنه."
+        "/history → انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
+        "/status → آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
+        "بات هر ۵ دقیقه به صورت خودکار مانهوای جدید و چپتر جدید رو برات می‌فرسته."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,10 +217,17 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await context.bot.send_message(query.from_user.id, f"خطا: {e}")
 
-# ================== چک خودکار ==================
+# ================== چک خودکار (بدون JobQueue) ==================
 
-def check_loop(bot: Bot):
+def check_loop(application: Application):
+    """این تابع تو یه ترد جداگانه اجرا می‌شه و هر چند دقیقه چک می‌کنه.
+    یک event loop اختصاصی برای خودش می‌سازه تا با لوپ پولینگ بات تداخل نکنه."""
+    bot = application.bot
     print("حلقه چک خودکار شروع شد...")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     while True:
         try:
             if not ALLOWED_IDS:
@@ -236,10 +242,6 @@ def check_loop(bot: Bot):
             r.raise_for_status()
             manhwas = r.json()
 
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
             for m in manhwas:
                 mid = str(m["id"])
                 chapters = get_chapters(m["id"])
@@ -251,7 +253,7 @@ def check_loop(bot: Bot):
                         loop.run_until_complete(send_manhwa(bot, uid, m, genres_map, current_ch))
                     known[mid] = current_ch
                 else:
-                    last_ch = known.get(mid, 0)
+                    last_ch = known[mid]
                     if current_ch > last_ch:
                         print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
                         text = f"🆕 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}"
@@ -264,7 +266,6 @@ def check_loop(bot: Bot):
             state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             save_state(state)
             print("چک انجام شد.")
-            loop.close()
 
         except Exception as e:
             print("خطا در چک خودکار:", e)
@@ -274,12 +275,8 @@ def check_loop(bot: Bot):
 # ================== اجرا ==================
 
 def run_bot():
-    if not BOT_TOKEN or not ALLOWED_IDS:
-        print("❌ BOT_TOKEN یا ALLOWED_IDS تنظیم نشده!")
-        return
-
-    print(f"بات شروع شد | آیدی‌های مجاز: {ALLOWED_IDS}")
-
+    """پولینگ بات رو تو یه لوپ بی‌نهایت اجرا می‌کنه و اگه به هر دلیلی کرش کرد
+    (که علت اصلیِ 'دیگه به /start جواب نمیده' همینه)، خودکار دوباره راهش می‌ندازه."""
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -288,21 +285,32 @@ def run_bot():
     application.add_handler(CommandHandler("history", history))
     application.add_handler(CallbackQueryHandler(history_callback, pattern="^hist_"))
 
-    # شروع حلقه چک
-    checker = threading.Thread(target=check_loop, args=(application.bot,), daemon=True)
-    checker.start()
+    checker_thread = threading.Thread(target=check_loop, args=(application,), daemon=True)
+    checker_thread.start()
 
-    # اجرای بات
-    application.run_polling(drop_pending_updates=True)
+    while True:
+        try:
+            # === تغییر ۲: چون run_polling تو یه ترد فرعی اجرا می‌شه (نه ترد اصلی)،
+            # نباید سعی کنه signal handler رجیستر کنه؛ وگرنه با یه خطای بی‌صدا
+            # لوپ می‌میره و دیگه به هیچ دستوری (از جمله /start) جواب نمی‌ده.
+            # stop_signals=None این مشکل رو حل می‌کنه.
+            application.run_polling(drop_pending_updates=True, stop_signals=None)
+        except Exception as e:
+            print("پولینگ بات کرش کرد، ۵ ثانیه دیگه دوباره تلاش می‌کنیم:", e)
+            time.sleep(5)
+
+def main():
+    if not BOT_TOKEN or not ALLOWED_IDS:
+        print("❌ BOT_TOKEN یا ALLOWED_IDS تنظیم نشده!")
+        return
+
+    print(f"بات شروع شد | آیدی‌های مجاز: {ALLOWED_IDS}")
+    run_bot()
 
 if __name__ == "__main__":
-    # Flask در ترد جدا
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False),
-        daemon=True
-    )
-    flask_thread.start()
-    print(f"Flask روی پورت {PORT} اجرا شد")
+    # Flask رو تو ترد اصلی اجرا می‌کنیم
+    bot_thread = threading.Thread(target=main, daemon=True)
+    bot_thread.start()
 
-    # بات در ترد اصلی
-    run_bot()
+    print(f"Flask در حال اجرا روی پورت {PORT}...")
+    app.run(host="0.0.0.0", port=PORT)
