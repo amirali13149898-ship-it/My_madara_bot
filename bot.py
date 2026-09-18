@@ -1,8 +1,10 @@
 import os
 import json
 import time
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
+from flask import Flask
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
@@ -11,6 +13,7 @@ from telegram.constants import ParseMode
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))  # پیش‌فرض ۵ دقیقه
+PORT = int(os.getenv("PORT", 10000))
 
 STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
@@ -18,6 +21,12 @@ API_GENRES = "https://manhwahub-tau.vercel.app/api/genres"
 API_CHAPTERS = "https://manhwahub-tau.vercel.app/api/chapters?manhwa_id={}"
 
 # ============================================================
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Manhwa Hub Bot is running ✅", 200
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -109,8 +118,7 @@ async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter
                 chat_id=chat_id,
                 photo=cover,
                 caption=caption,
-                reply_markup=keyboard,
-                parse_mode=None
+                reply_markup=keyboard
             )
         else:
             await bot.send_message(
@@ -120,7 +128,6 @@ async def send_manhwa(bot: Bot, chat_id: int, m: dict, genres_map: dict, chapter
             )
     except Exception as e:
         print(f"خطا در ارسال {m['title']}: {e}")
-        # اگه عکس مشکل داشت، متنی بفرست
         await bot.send_message(chat_id=chat_id, text=caption, reply_markup=keyboard)
 
 # ================== دستورات ==================
@@ -239,7 +246,7 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chapters = get_chapters(m["id"])
             ch_count = max([c.get("chapter_number", 0) for c in chapters], default=0)
             await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count)
-            time.sleep(1.5)  # کمی فاصله تا اسپم نشه
+            time.sleep(1.5)
 
         await context.bot.send_message(query.from_user.id, "✅ ارسال تمام شد.")
 
@@ -255,7 +262,7 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
     bot = context.bot
     state = load_state()
-    known = state.get("known_manhwas", {})  # {id: last_chapter_count}
+    known = state.get("known_manhwas", {})
     genres_map = get_genres_map()
 
     try:
@@ -269,7 +276,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             current_ch = max([c.get("chapter_number", 0) for c in chapters], default=0)
 
             if mid not in known:
-                # مانهوای کاملاً جدید
                 print(f"مانهوای جدید: {m['title']}")
                 for uid in ALLOWED_IDS:
                     await send_manhwa(bot, uid, m, genres_map, current_ch)
@@ -278,7 +284,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
             else:
                 last_ch = known[mid]
                 if current_ch > last_ch:
-                    # چپتر جدید
                     print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
                     text = f"🆕 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}"
                     keyboard = make_keyboard(m["slug"])
@@ -294,9 +299,9 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print("خطا در چک خودکار:", e)
 
-# ================== اجرا ==================
+# ================== اجرای بات ==================
 
-def main():
+def run_bot():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN تنظیم نشده!")
         return
@@ -306,18 +311,25 @@ def main():
 
     print(f"بات شروع شد | آیدی‌های مجاز: {ALLOWED_IDS}")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CallbackQueryHandler(history_callback, pattern="^hist_"))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("history", history))
+    application.add_handler(CallbackQueryHandler(history_callback, pattern="^hist_"))
 
-    # چک خودکار هر ۵ دقیقه
-    app.job_queue.run_repeating(check_updates, interval=CHECK_INTERVAL, first=10)
+    application.job_queue.run_repeating(check_updates, interval=CHECK_INTERVAL, first=10)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+# ================== اجرا ==================
 
 if __name__ == "__main__":
-    main()
+    # بات رو تو یه ترد جداگانه اجرا می‌کنیم
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # سرور Flask برای زنده موندن سرویس
+    print(f"Flask در حال اجرا روی پورت {PORT}...")
+    app.run(host="0.0.0.0", port=PORT)
