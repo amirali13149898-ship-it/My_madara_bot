@@ -140,8 +140,8 @@ def format_caption(m, genres_map, chapter_count=None, max_len=None):
 
     # کپشن عکس حداکثر ۱۰۲۴ کاراکتره؛ اگه خلاصه بلند باشه فقط خلاصه کوتاه می‌شه
     if max_len and len(caption) > max_len:
-        cut = len(caption) - max_len + 1
-        summary = summary[: max(0, len(summary) - cut)].rstrip() + "…"
+        cut = len(caption) - max_len + 3  # ۳ کاراکتر برای "..."
+        summary = summary[: max(0, len(summary) - cut)].rstrip() + "..."
         caption = build(summary)
     return caption
 
@@ -195,6 +195,9 @@ async def send_manhwa(bot: Bot, chat_id, m: dict, genres_map: dict, chapter_coun
     cover = m.get("cover_url")
 
     footer = FOOTER_TEXT if not preview else ""
+    # اگه فوتر از قبل تو خود کپشن هست (مثل @Manhwa_Hub_News)، دوباره اضافه‌ش نکن
+    if footer and footer in format_caption(m, genres_map, chapter_count):
+        footer = ""
     reserve = (len(footer) + 2) if footer else 0
     caption = format_caption(m, genres_map, chapter_count, max_len=CAPTION_LIMIT - reserve)
     full_text = format_caption(m, genres_map, chapter_count, max_len=TEXT_LIMIT - reserve)
