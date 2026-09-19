@@ -4,11 +4,13 @@ import time
 import asyncio
 import hashlib
 import threading
+import io
 import requests
+from urllib.parse import urljoin, quote
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 # ================== تنظیمات ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -20,6 +22,15 @@ PORT = int(os.getenv("PORT", 10000))
 # می‌تونه یوزرنیم کانال باشه (@Manhwa_Hub_News) یا آیدی عددی (-100123...)
 _raw_channel = os.getenv("CHANNEL_ID", "@Manhwa_Hub_News").strip()
 CHANNEL_ID = int(_raw_channel) if _raw_channel.lstrip("-").isdigit() else _raw_channel
+
+# متنی که زیر هر پیام کانال اضافه می‌شه (خالی = خاموش). تو Render به‌صورت env با اسم CHANNEL_FOOTER بذار.
+FOOTER_TEXT = os.getenv("CHANNEL_FOOTER", "").strip()
+# دکمه‌ی شیشه‌ای که زیر هر پیام جدید کانال اضافه می‌شه. خاموش‌کردن: CHANNEL_BUTTON_ENABLED=0
+BUTTON_ENABLED = os.getenv("CHANNEL_BUTTON_ENABLED", "1").strip() != "0"
+BUTTON_TEXT = os.getenv("CHANNEL_BUTTON_TEXT", "🌐 بازکردن سایت").strip()
+BUTTON_URL = os.getenv("CHANNEL_BUTTON_URL", "https://manhwahub-tau.vercel.app/").strip()
+CAPTION_LIMIT = 1024   # سقف کپشن عکس تو تلگرام
+TEXT_LIMIT = 4096      # سقف پیام متنی
 
 STATE_FILE = "state.json"
 API_MANHWAS = "https://manhwahub-tau.vercel.app/api/manhwas"
@@ -92,7 +103,7 @@ def make_hashtag(text: str) -> str:
     cleaned = "".join(c for c in text if c.isalnum() or c in "آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیء ")
     return "#" + cleaned.replace(" ", "_")
 
-def format_caption(m, genres_map, chapter_count=None):
+def format_caption(m, genres_map, chapter_count=None, max_len=None):
     fa_title = m["title"]
     en_title = m.get("english_title") or "—"
     rating = m.get("rating", "—")
@@ -110,20 +121,28 @@ def format_caption(m, genres_map, chapter_count=None):
     fa_tag = make_hashtag(fa_title)
     en_tag = make_hashtag(en_title)
 
-    # لینک خام از کپشن حذف شد؛ حالا دکمه «بازکردن سایت» جاشو گرفته
-    caption = f"""👤اسم فارسی مانهوا : {fa_title}
+    def build(summ):
+        return f"""👤اسم فارسی مانهوا : {fa_title}
 👤 اسم انگلیسی مانهوا : {en_title}
 ⛓ژانر ها : {genres_str}
 نمره : {rating}
 👁وضعیت پخش : {status}
 نحوه پیدا کردن : {fa_tag} {en_tag}
 خلاصه :
-«{summary}»
+«{summ}»
 
 {chapter_line}
 
 🗣️@Manhwa_Hub_News
 {en_tag}"""
+
+    caption = build(summary)
+
+    # کپشن عکس حداکثر ۱۰۲۴ کاراکتره؛ اگه خلاصه بلند باشه فقط خلاصه کوتاه می‌شه
+    if max_len and len(caption) > max_len:
+        cut = len(caption) - max_len + 1
+        summary = summary[: max(0, len(summary) - cut)].rstrip() + "…"
+        caption = build(summary)
     return caption
 
 def make_keyboard(slug: str):
@@ -151,21 +170,54 @@ def make_notify_keyboard(m: dict):
         [InlineKeyboardButton("📖 مشاهده مانهوا", url=f"{SITE_ROOT}manhwa/{m['slug']}")],
     ])
 
+def _fetch_cover_bytes(url: str) -> bytes:
+    """کاور رو خودمون دانلود می‌کنیم (به‌جای اینکه تلگرام از روی لینک بکشه)."""
+    full = urljoin(SITE_ROOT, url.strip())
+    full = quote(full, safe=":/?&=%#@+~,;")
+    r = requests.get(full, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.content
+
+def _to_jpeg_bytes(data: bytes) -> bytes:
+    """تبدیل به JPEG و کوچک‌کردن (برای فرمت‌های عجیب مثل avif/webp یا عکس‌های خیلی بزرگ)."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(data))
+    img = img.convert("RGB")
+    img.thumbnail((2000, 2000))
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
 async def send_manhwa(bot: Bot, chat_id, m: dict, genres_map: dict, chapter_count=None, preview=False):
     """preview=True → نسخه‌ی پیش‌نمایش برای ادمین (با دکمه‌ی ارسال به کانال).
     preview=False → نسخه‌ی نهایی که تو کانال قرار می‌گیره (فقط دکمه‌های اصلی)."""
-    caption = format_caption(m, genres_map, chapter_count)
     keyboard = make_preview_keyboard(m) if preview else make_keyboard(m["slug"])
     cover = m.get("cover_url")
 
-    try:
-        if cover:
-            await bot.send_photo(chat_id=chat_id, photo=cover, caption=caption, reply_markup=keyboard)
-        else:
-            await bot.send_message(chat_id=chat_id, text=caption, reply_markup=keyboard)
-    except Exception as e:
-        print(f"خطا در ارسال {m['title']}: {e}")
-        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=keyboard)
+    footer = FOOTER_TEXT if not preview else ""
+    reserve = (len(footer) + 2) if footer else 0
+    caption = format_caption(m, genres_map, chapter_count, max_len=CAPTION_LIMIT - reserve)
+    full_text = format_caption(m, genres_map, chapter_count, max_len=TEXT_LIMIT - reserve)
+    if footer:
+        caption += "\n\n" + footer
+        full_text += "\n\n" + footer
+
+    if cover:
+        try:
+            data = await asyncio.to_thread(_fetch_cover_bytes, cover)
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=data, caption=caption, reply_markup=keyboard)
+                return
+            except Exception as e1:
+                print(f"ارسال مستقیم کاور {m['title']} نشد ({e1})؛ تبدیل به JPEG...")
+                jpg = await asyncio.to_thread(_to_jpeg_bytes, data)
+                await bot.send_photo(chat_id=chat_id, photo=jpg, caption=caption, reply_markup=keyboard)
+                return
+        except Exception as e:
+            print(f"❌ خطا در ارسال کاور {m['title']} | cover_url={cover} | {e}")
+
+    # آخرین راه: بدون کاور
+    await bot.send_message(chat_id=chat_id, text=full_text, reply_markup=keyboard)
 
 async def send_list(bot: Bot, chat_id: int, items: list):
     if not items:
@@ -552,6 +604,72 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"خطا: {e}")
 
+# ================== فوتر خودکار زیر پیام‌های کانال ==================
+
+def _is_our_channel(chat) -> bool:
+    if isinstance(CHANNEL_ID, int):
+        return chat.id == CHANNEL_ID
+    return (chat.username or "").lower() == str(CHANNEL_ID).lstrip("@").lower()
+
+def _markup_with_button(old_markup):
+    """کیبورد فعلی پیام رو نگه می‌داره و دکمه‌ی ما رو ته‌ش اضافه می‌کنه.
+    اگه دکمه‌ای با همین لینک از قبل باشه، None برمی‌گردونه (یعنی نیازی به ادیت نیست)."""
+    rows = [list(r) for r in old_markup.inline_keyboard] if old_markup else []
+    if any(getattr(b, "url", None) == BUTTON_URL for r in rows for b in r):
+        return None
+    rows.append([InlineKeyboardButton(BUTTON_TEXT, url=BUTTON_URL)])
+    return InlineKeyboardMarkup(rows)
+
+async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """هر پیام جدید کانال: اگه فوتر / دکمه‌ی شیشه‌ای نداشت، همه رو تو یک ادیت اضافه می‌کنه.
+    (پست‌هایی که خود بات می‌فرسته این آپدیت رو نمی‌گیره؛ فوتر و دکمه‌شون تو send_manhwa میاد.)"""
+    msg = update.channel_post
+    if not msg or not _is_our_channel(msg.chat):
+        return
+
+    want_button = BUTTON_ENABLED and bool(BUTTON_URL)
+    if not FOOTER_TEXT and not want_button:
+        return
+
+    if msg.text is not None:
+        is_text, original, entities, limit = True, msg.text, msg.entities, TEXT_LIMIT
+    elif msg.photo or msg.video or msg.document or msg.animation or msg.audio or msg.voice:
+        # تو آلبوم دکمه/کپشن نمی‌ذاریم؛ آلبوم جدا ادیت نمی‌شه
+        if msg.media_group_id:
+            return
+        is_text, original, entities, limit = False, msg.caption or "", msg.caption_entities, CAPTION_LIMIT
+    else:
+        return  # استیکر، نظرسنجی و ... قابل ادیت نیستن
+
+    # اول چک: چی از قبل هست؟
+    new_text = None
+    if FOOTER_TEXT and FOOTER_TEXT not in original:
+        candidate = f"{original}\n\n{FOOTER_TEXT}" if original else FOOTER_TEXT
+        if len(candidate) <= limit:
+            new_text = candidate
+        else:
+            print(f"فوتر جا نشد (پیام {msg.message_id}): {len(candidate)} > {limit}")
+
+    new_markup = _markup_with_button(msg.reply_markup) if want_button else None
+
+    if new_text is None and new_markup is None:
+        return  # همه‌چیز از قبل هست
+
+    ents = list(entities) if entities else None
+    markup = new_markup or msg.reply_markup
+    chat_id, mid = msg.chat.id, msg.message_id
+    try:
+        if new_text is not None and is_text:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=mid, text=new_text,
+                                                entities=ents, reply_markup=markup)
+        elif new_text is not None:
+            await context.bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=new_text,
+                                                   caption_entities=ents, reply_markup=markup)
+        else:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=mid, reply_markup=markup)
+    except Exception as e:
+        print(f"خطا در ادیت پیام {mid}: {e}")
+
 # ================== چک خودکار (بدون JobQueue) ==================
 
 def check_loop():
@@ -643,6 +761,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok_"))
     application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno_"))
     application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
+    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_handler))
     return application
 
 def run_flask():
