@@ -15,8 +15,18 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 # ================== تنظیمات ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()]
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "900"))  # فاصله‌ی چک سریع (ثانیه) - پیش‌فرض ۱۵ دقیقه
+# هر چند ثانیه یک‌بار چپترِ «همه‌ی» مانهواها چک بشه (چک کامل). بین چک‌های کامل فقط مانهواهای «داغ»
+# (اونایی که تو HOT_WINDOW_HOURS ساعت اخیر چپتر جدید داشتن) و لیست مانهواها چک می‌شن.
+# برای برگشت به رفتار قبلی (چک کامل در هر دور): FULL_SCAN_INTERVAL رو برابر CHECK_INTERVAL بذار.
+FULL_SCAN_INTERVAL = int(os.getenv("FULL_SCAN_INTERVAL", "3600"))
+HOT_WINDOW = int(os.getenv("HOT_WINDOW_HOURS", "72")) * 3600
+MANHWAS_CACHE_TTL = 60    # ثانیه؛ برای منوها/آرشیو/جستجو
+GENRES_CACHE_TTL = 600    # ثانیه
 PORT = int(os.getenv("PORT", 10000))
+# چک خودکار پس‌زمینه. پیش‌فرض خاموشه؛ بات فقط وقتی /start یا /check بزنی چک می‌کنه (کمترین مصرف ترافیک).
+# برای روشن‌کردن دوباره‌ی چک خودکار: AUTO_CHECK=1
+AUTO_CHECK = os.getenv("AUTO_CHECK", "0").strip() == "1"
 
 # کانالی که پست‌ها بعد از تأیید بهش فرستاده می‌شن.
 # می‌تونه یوزرنیم کانال باشه (@Manhwa_Hub_News) یا آیدی عددی (-100123...)
@@ -63,15 +73,29 @@ def save_state(state):
 def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_IDS
 
-def fetch_manhwas():
+_cache = {"manhwas": (0.0, None), "genres": (0.0, None)}
+
+def fetch_manhwas(force=False):
+    """لیست مانهواها. برای منوها یه کش کوتاه (۶۰ ثانیه) داره تا هر کلیک یه درخواست کامل نزنه.
+    force=True یعنی همیشه تازه از سایت بگیر (چک خودکار، دریافت مشخصات، ارسال به کانال)."""
+    ts, data = _cache["manhwas"]
+    if not force and data is not None and time.time() - ts < MANHWAS_CACHE_TTL:
+        return data
     r = requests.get(API_MANHWAS, timeout=20)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    _cache["manhwas"] = (time.time(), data)
+    return data
 
-def get_genres_map():
+def get_genres_map(force=False):
+    ts, data = _cache["genres"]
+    if not force and data is not None and time.time() - ts < GENRES_CACHE_TTL:
+        return data
     r = requests.get(API_GENRES, timeout=15)
     r.raise_for_status()
-    return {g["id"]: g["name"] for g in r.json()}
+    data = {g["id"]: g["name"] for g in r.json()}
+    _cache["genres"] = (time.time(), data)
+    return data
 
 def get_chapters(manhwa_id):
     try:
@@ -266,6 +290,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "چطوری ارباب 👑\nمی‌خوای مانهواهایی که تا الان اومدن رو دریافت کنی؟",
         reply_markup=keyboard,
     )
+    # چک موارد جدید (در پس‌زمینه تا منو معطل نشه). اگه چیزی جدید نبود، پیام اضافه‌ای نمی‌آید.
+    context.application.create_task(
+        run_manual_check(context.bot, update.effective_chat.id, report_empty=False)
+    )
 
 async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -275,7 +303,7 @@ async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "start_no":
         await query.edit_message_text(
-            "باشه ارباب 🙏\nهر مانهوا یا چپتر جدیدی که بیاد همون لحظه خبرت می‌کنم."
+            "باشه ارباب 🙏\nهر وقت /start یا /check بزنی، مانهواها و چپترهای جدید رو برات می‌فرستم."
         )
     else:  # start_yes یا menu_back
         await query.edit_message_text(
@@ -291,8 +319,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history → انتخاب بازه زمانی و دریافت مانهواهای اون دوره\n"
         "/archive → لیست همه‌ی مانهواها (صفحه‌بندی‌شده) و انتخاب یکی‌یکی\n"
         "/search اسم → جستجوی مانهوا با اسم فارسی یا انگلیسی\n"
+        "/check → چک دستی مانهوا و چپتر جدید\n"
         "/status → آخرین چک + تعداد مانهواهای ثبت‌شده\n\n"
-        "بات هر ۵ دقیقه چک می‌کنه و اگه مانهوای جدید، چپتر جدید یا تغییری باشه بهت خبر می‌ده. "
+        + (f"بات هر {CHECK_INTERVAL // 60} دقیقه خودش چک می‌کنه. " if AUTO_CHECK else "بات خودکار چک نمی‌کنه؛ هر وقت /start یا /check بزنی چک می‌کنه. ")
+        + "اگه مانهوای جدید، چپتر جدید یا تغییری باشه بهت خبر می‌ده. "
         "با دکمه «📩 دریافت مشخصات» می‌تونی مشخصات کامل اون مانهوا رو بگیری.\n\n"
         "هر مانهوایی که برات میاد یه پیش‌نمایشه؛ اگه خوب بود با دکمه‌ی «📢 ارسال به کانال» "
         "و بعد «✅ آره، بفرست» همون پست با دکمه‌های شیشه‌ای تو کانال منتشر می‌شه."
@@ -308,7 +338,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 وضعیت بات:\n\n"
         f"تعداد مانهواهای شناخته‌شده: {known_count}\n"
         f"آخرین چک: {last}\n"
-        f"فاصله چک: هر {CHECK_INTERVAL // 60} دقیقه"
+        + (f"فاصله چک: هر {CHECK_INTERVAL // 60} دقیقه" if AUTO_CHECK else "چک: دستی (با /start یا /check)")
     )
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,12 +435,12 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mid = query.data[5:]
     try:
-        manhwas = await asyncio.to_thread(fetch_manhwas)
+        manhwas = await asyncio.to_thread(fetch_manhwas, True)
         m = next((x for x in manhwas if str(x["id"]) == mid), None)
         if not m:
             await context.bot.send_message(query.from_user.id, "این مانهوا دیگه پیدا نشد.")
             return
-        genres_map = await asyncio.to_thread(get_genres_map)
+        genres_map = await asyncio.to_thread(get_genres_map, True)
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
         await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count, preview=True)
     except Exception as e:
@@ -482,7 +512,7 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("در حال ارسال به کانال...")
 
     try:
-        manhwas = await asyncio.to_thread(fetch_manhwas)
+        manhwas = await asyncio.to_thread(fetch_manhwas, True)
         m = next((x for x in manhwas if str(x["id"]) == mid), None)
         if not m:
             await query.edit_message_reply_markup(
@@ -490,7 +520,7 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await context.bot.send_message(query.from_user.id, "این مانهوا دیگه پیدا نشد.")
             return
-        genres_map = await asyncio.to_thread(get_genres_map)
+        genres_map = await asyncio.to_thread(get_genres_map, True)
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
 
         # مشخصات از API تازه گرفته می‌شه؛ پس پست کانال همیشه آخرین اطلاعات رو داره
@@ -675,6 +705,123 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ================== چک خودکار (بدون JobQueue) ==================
 
+_state_lock = threading.Lock()
+
+def check_once(notify, now=None, full=False):
+    """یک دور چک. هر دور لیست مانهواها رو (یه درخواست) می‌گیره تا مانهوای جدید و تغییر مشخصات پیدا بشه.
+    چپترها فقط برای این مانهواها گرفته می‌شن:
+      - مانهوای جدید
+      - دور «چک کامل» (هر FULL_SCAN_INTERVAL ثانیه، برای همه)
+      - مانهواهای «داغ» (تو HOT_WINDOW ساعت اخیر چپتر جدید داشتن)
+    """
+    with _state_lock:
+        return _check_once_locked(notify, now, full)
+
+def _check_once_locked(notify, now, full):
+    now = time.time() if now is None else now
+    state = load_state()
+    known = state.get("known_manhwas", {})
+    first_run = not known  # اولین اجرا: فقط ثبت می‌کنیم، اسپم نمی‌کنیم
+    full_due = full or first_run or (now - state.get("last_full_scan", 0)) >= FULL_SCAN_INTERVAL
+
+    manhwas = fetch_manhwas(force=True)
+
+    for m in manhwas:
+        mid = str(m["id"])
+        fp = fingerprint(m)
+        entry = known.get(mid)
+
+        # سازگاری با state.json قدیمی (که فقط عدد چپتر بود)
+        if isinstance(entry, int):
+            entry = {"ch": entry, "fp": fp}
+            known[mid] = entry
+
+        if entry is None:
+            current_ch = get_max_chapter(m["id"])
+            known[mid] = {"ch": current_ch, "fp": fp}
+            if not first_run:
+                print(f"مانهوای جدید: {m['title']}")
+                en = m.get("english_title") or ""
+                notify(f"🆕 مانهوای جدید اضافه شد!\n\n{m['title']}\n{en}".strip(), m)
+            continue
+
+        last_ch = entry["ch"]
+        hot = (now - entry.get("hot_ts", 0)) < HOT_WINDOW
+        if full_due or hot:
+            current_ch = get_max_chapter(m["id"])
+        else:
+            current_ch = last_ch  # این دور چپترهای این مانهوا رو نمی‌گیریم
+
+        new_entry = {"ch": max(current_ch, last_ch), "fp": fp}
+        if "hot_ts" in entry:
+            new_entry["hot_ts"] = entry["hot_ts"]
+
+        if current_ch > last_ch:
+            print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
+            notify(f"🔔 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}", m)
+            new_entry["hot_ts"] = now
+        elif fp != entry.get("fp"):
+            print(f"مشخصات تغییر کرد: {m['title']}")
+            notify(f"✏️ مشخصات این مانهوا تغییر کرده:\n\n{m['title']}", m)
+        # اگه دریافت چپترها خطا داد (۰ برگشت)، عدد قبلی حفظ می‌شه
+        known[mid] = new_entry
+
+    state["known_manhwas"] = known
+    if full_due:
+        state["last_full_scan"] = now
+    state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    save_state(state)
+    return first_run
+
+# ================== چک دستی (با /start یا /check) ==================
+
+_manual_running = False
+
+async def run_manual_check(bot: Bot, chat_id, report_empty: bool = True):
+    """یک چک کامل انجام می‌ده و فقط مانهواها/چپترهای جدید از آخرین چک رو برای همین چت می‌فرسته."""
+    global _manual_running
+    if _manual_running:
+        if report_empty:
+            await bot.send_message(chat_id, "یه چک دیگه در حال انجامه؛ چند لحظه صبر کن ⏳")
+        return
+    _manual_running = True
+    try:
+        events = []
+        first_run = await asyncio.to_thread(
+            check_once, lambda text, m: events.append((text, m)), None, True
+        )
+        for text, m in events:
+            try:
+                await bot.send_message(chat_id, text, reply_markup=make_notify_keyboard(m))
+            except Exception as e:
+                print(f"خطا در ارسال اطلاع‌رسانی: {e}")
+            await asyncio.sleep(0.5)
+        if first_run:
+            await bot.send_message(
+                chat_id,
+                "✅ لیست فعلی مانهواها و چپترها ثبت شد.\nاز این به بعد هر وقت /start یا /check بزنی، "
+                "موارد جدید رو برات می‌فرستم.",
+            )
+        elif not events and report_empty:
+            await bot.send_message(chat_id, "✅ چیز جدیدی نیست؛ مانهوا یا چپتر تازه‌ای اضافه نشده.")
+    except Exception as e:
+        print(f"خطا در چک دستی: {e}")
+        if report_empty:
+            try:
+                await bot.send_message(chat_id, f"خطا در چک: {e}")
+            except Exception:
+                pass
+    finally:
+        _manual_running = False
+
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text("در حال چک مانهواها و چپترها... 🔍")
+    context.application.create_task(
+        run_manual_check(context.bot, update.effective_chat.id, report_empty=True)
+    )
+
 def check_loop():
     """تو یه ترد جدا اجرا می‌شه. لوپ و Bot اختصاصی خودش رو داره تا با پولینگ تداخل نکنه.
     فقط اطلاع می‌ده؛ مشخصات کامل با دکمه‌ی «دریافت مشخصات» فرستاده می‌شه."""
@@ -698,43 +845,7 @@ def check_loop():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            state = load_state()
-            known = state.get("known_manhwas", {})
-            first_run = not known  # اولین اجرا: فقط ثبت می‌کنیم، اسپم نمی‌کنیم
-
-            manhwas = fetch_manhwas()
-
-            for m in manhwas:
-                mid = str(m["id"])
-                fp = fingerprint(m)
-                current_ch = get_max_chapter(m["id"])
-                entry = known.get(mid)
-
-                # سازگاری با state.json قدیمی (که فقط عدد چپتر بود)
-                if isinstance(entry, int):
-                    entry = {"ch": entry, "fp": fp}
-                    known[mid] = entry
-
-                if entry is None:
-                    known[mid] = {"ch": current_ch, "fp": fp}
-                    if not first_run:
-                        print(f"مانهوای جدید: {m['title']}")
-                        en = m.get("english_title") or ""
-                        notify(f"🆕 مانهوای جدید اضافه شد!\n\n{m['title']}\n{en}".strip(), m)
-                else:
-                    last_ch = entry["ch"]
-                    if current_ch > last_ch:
-                        print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
-                        notify(f"🔔 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}", m)
-                    elif fp != entry.get("fp"):
-                        print(f"مشخصات تغییر کرد: {m['title']}")
-                        notify(f"✏️ مشخصات این مانهوا تغییر کرده:\n\n{m['title']}", m)
-                    # اگه دریافت چپترها خطا داد (۰ برگشت)، عدد قبلی حفظ می‌شه
-                    known[mid] = {"ch": max(current_ch, last_ch), "fp": fp}
-
-            state["known_manhwas"] = known
-            state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            save_state(state)
+            check_once(notify)
             print("چک انجام شد.")
 
         except Exception as e:
@@ -753,6 +864,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("history", history))
     application.add_handler(CommandHandler("archive", archive_cmd))
     application.add_handler(CommandHandler("search", search_cmd))
+    application.add_handler(CommandHandler("check", check_cmd))
 
     application.add_handler(CallbackQueryHandler(start_callback, pattern=r"^(start_yes|start_no|menu_back)$"))
     application.add_handler(CallbackQueryHandler(history_callback, pattern=r"^hist_(\d+d|all)$"))
@@ -773,7 +885,10 @@ def run_flask():
 def run_bot():
     """پولینگ حتماً باید روی ترد اصلی اجرا بشه؛ python-telegram-bot تو ترد فرعی
     event loop نداره و پولینگ اصلاً بالا نمیاد (نتیجه: نه /start جواب می‌ده نه دکمه‌ها)."""
-    threading.Thread(target=check_loop, daemon=True).start()
+    if AUTO_CHECK:
+        threading.Thread(target=check_loop, daemon=True).start()
+    else:
+        print("چک خودکار خاموشه؛ چک فقط با /start یا /check انجام می‌شه.")
 
     while True:
         try:
