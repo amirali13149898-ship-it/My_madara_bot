@@ -290,9 +290,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "چطوری ارباب 👑\nمی‌خوای مانهواهایی که تا الان اومدن رو دریافت کنی؟",
         reply_markup=keyboard,
     )
-    # چک موارد جدید (در پس‌زمینه تا منو معطل نشه). اگه چیزی جدید نبود، پیام اضافه‌ای نمی‌آید.
+    # چک موارد جدید (در پس‌زمینه تا منو معطل نشه). نتیجه همیشه گفته می‌شه، حتی اگه چیزی جدید نباشه.
     context.application.create_task(
-        run_manual_check(context.bot, update.effective_chat.id, report_empty=False)
+        run_manual_check(context.bot, update.effective_chat.id, report_empty=True)
     )
 
 async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,7 +803,12 @@ async def run_manual_check(bot: Bot, chat_id, report_empty: bool = True):
                 "موارد جدید رو برات می‌فرستم.",
             )
         elif not events and report_empty:
-            await bot.send_message(chat_id, "✅ چیز جدیدی نیست؛ مانهوا یا چپتر تازه‌ای اضافه نشده.")
+            count = len(load_state().get("known_manhwas", {}))
+            await bot.send_message(
+                chat_id,
+                f"✅ چک شد ({count} مانهوا).\n"
+                "مانهوای جدید، چپتر جدید یا تغییر مشخصاتی نبود؛ چیزی برای اطلاع دادن نیست."
+            )
     except Exception as e:
         print(f"خطا در چک دستی: {e}")
         if report_empty:
