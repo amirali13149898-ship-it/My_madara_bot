@@ -127,7 +127,33 @@ def make_hashtag(text: str) -> str:
     cleaned = "".join(c for c in text if c.isalnum() or c in "آابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیء ")
     return "#" + cleaned.replace(" ", "_")
 
-def format_caption(m, genres_map, chapter_count=None, max_len=None):
+_ENDED_STATUS_VALUES = {
+    "end", "ended", "completed", "complete", "finished", "finish", "done",
+    "پایان", "پایان یافته", "پایان‌یافته", "تمام", "تمام شده", "به پایان رسیده",
+}
+
+def is_ended_status(status) -> bool:
+    """آیا وضعیت پخش یعنی مانهوا تمام شده؟ اگه مقدار status تو سایتت با این لیست فرق داره بهم بگو تا دقیق کنم."""
+    return str(status or "").strip().lower() in _ENDED_STATUS_VALUES
+
+def _split_payload(payload: str):
+    """payload خام بعد از پیشوند callback (مثلاً بعد از 'info_' یا 'pub_').
+    اگه شامل بازه‌ی چپترهای تازه باشه (فرمت '<mid>_r<from>_<to>')، اون رو هم جدا می‌کنه."""
+    if "_r" in payload:
+        mid, r = payload.rsplit("_r", 1)
+        try:
+            nf, nt = r.split("_")
+            return mid, int(nf), int(nt)
+        except Exception:
+            return mid, None, None
+    return payload, None, None
+
+def _make_payload(mid, new_from=None, new_to=None) -> str:
+    if new_from and new_to:
+        return f"{mid}_r{new_from}_{new_to}"
+    return str(mid)
+
+def format_caption(m, genres_map, chapter_count=None, max_len=None, new_chapters=None):
     fa_title = m["title"]
     en_title = m.get("english_title") or "—"
     rating = m.get("rating", "—")
@@ -141,7 +167,12 @@ def format_caption(m, genres_map, chapter_count=None, max_len=None):
     if chapter_count is None:
         chapter_count = get_max_chapter(m["id"])
 
-    chapter_line = f"𓆩 chapter 01_{chapter_count:02d}🔚" if chapter_count > 0 else "𓆩 chapter 01_01🔚"
+    symbol = "🔚" if is_ended_status(status) else "🔄"
+    base_count = chapter_count if chapter_count > 0 else 1
+    chapter_line = f"𓆩 chapter 01_{base_count:02d}{symbol}"
+    if new_chapters:
+        for ch in sorted(set(new_chapters)):
+            chapter_line += f"\n𓆩 chapter {ch:02d}🆕"
     fa_tag = make_hashtag(fa_title)
     en_tag = make_hashtag(en_title)
 
@@ -181,16 +212,17 @@ def make_keyboard(slug: str):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def make_preview_keyboard(m: dict):
+def make_preview_keyboard(m: dict, new_from=None, new_to=None):
     """کیبورد نسخه‌ی پیش‌نمایش (فقط برای ادمین): دکمه‌های اصلی پست + دکمه‌ی تأیید و ارسال به کانال."""
     rows = [list(r) for r in make_keyboard(m["slug"]).inline_keyboard]
-    rows.append([InlineKeyboardButton("📢 ارسال به کانال", callback_data=f"pub_{m['id']}")])
+    rows.append(_send_button(_make_payload(m["id"], new_from, new_to)))
     return InlineKeyboardMarkup(rows)
 
-def make_notify_keyboard(m: dict):
+def make_notify_keyboard(m: dict, new_from=None, new_to=None):
     """کیبورد پیام اطلاع‌رسانی: ادمین با زدن دکمه اول مشخصات کامل رو می‌گیره."""
+    payload = _make_payload(m["id"], new_from, new_to)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 دریافت مشخصات", callback_data=f"info_{m['id']}")],
+        [InlineKeyboardButton("📩 دریافت مشخصات", callback_data=f"info_{payload}")],
         [InlineKeyboardButton("📖 مشاهده مانهوا", url=f"{SITE_ROOT}manhwa/{m['slug']}")],
     ])
 
@@ -212,19 +244,22 @@ def _to_jpeg_bytes(data: bytes) -> bytes:
     img.save(out, format="JPEG", quality=90)
     return out.getvalue()
 
-async def send_manhwa(bot: Bot, chat_id, m: dict, genres_map: dict, chapter_count=None, preview=False):
+async def send_manhwa(bot: Bot, chat_id, m: dict, genres_map: dict, chapter_count=None, preview=False,
+                       new_from=None, new_to=None):
     """preview=True → نسخه‌ی پیش‌نمایش برای ادمین (با دکمه‌ی ارسال به کانال).
-    preview=False → نسخه‌ی نهایی که تو کانال قرار می‌گیره (فقط دکمه‌های اصلی)."""
-    keyboard = make_preview_keyboard(m) if preview else make_keyboard(m["slug"])
+    preview=False → نسخه‌ی نهایی که تو کانال قرار می‌گیره (فقط دکمه‌های اصلی).
+    new_from/new_to → اگه این پست به‌خاطر چپتر(های) تازه ساخته شده، بازه‌ی شماره‌ی چپترهایی که تازه اضافه شدن."""
+    keyboard = make_preview_keyboard(m, new_from, new_to) if preview else make_keyboard(m["slug"])
     cover = m.get("cover_url")
+    new_chapters = list(range(new_from, new_to + 1)) if (new_from and new_to) else None
 
     footer = FOOTER_TEXT if not preview else ""
     # اگه فوتر از قبل تو خود کپشن هست (مثل @Manhwa_Hub_News)، دوباره اضافه‌ش نکن
     if footer and footer in format_caption(m, genres_map, chapter_count):
         footer = ""
     reserve = (len(footer) + 2) if footer else 0
-    caption = format_caption(m, genres_map, chapter_count, max_len=CAPTION_LIMIT - reserve)
-    full_text = format_caption(m, genres_map, chapter_count, max_len=TEXT_LIMIT - reserve)
+    caption = format_caption(m, genres_map, chapter_count, max_len=CAPTION_LIMIT - reserve, new_chapters=new_chapters)
+    full_text = format_caption(m, genres_map, chapter_count, max_len=TEXT_LIMIT - reserve, new_chapters=new_chapters)
     if footer:
         caption += "\n\n" + footer
         full_text += "\n\n" + footer
@@ -433,7 +468,7 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer("در حال ارسال مشخصات...")
 
-    mid = query.data[5:]
+    mid, new_from, new_to = _split_payload(query.data[5:])
     try:
         manhwas = await asyncio.to_thread(fetch_manhwas, True)
         m = next((x for x in manhwas if str(x["id"]) == mid), None)
@@ -442,7 +477,8 @@ async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         genres_map = await asyncio.to_thread(get_genres_map, True)
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
-        await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count, preview=True)
+        await send_manhwa(context.bot, query.from_user.id, m, genres_map, ch_count, preview=True,
+                           new_from=new_from, new_to=new_to)
     except Exception as e:
         await context.bot.send_message(query.from_user.id, f"خطا: {e}")
 
@@ -508,7 +544,8 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("این پست قبلاً به کانال فرستاده شده ✅", show_alert=True)
         return
 
-    mid = query.data[6:]
+    raw_payload = query.data[6:]
+    mid, new_from, new_to = _split_payload(raw_payload)
     await query.answer("در حال ارسال به کانال...")
 
     try:
@@ -516,7 +553,7 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = next((x for x in manhwas if str(x["id"]) == mid), None)
         if not m:
             await query.edit_message_reply_markup(
-                reply_markup=_keyboard_with_row(query, _send_button(mid))
+                reply_markup=_keyboard_with_row(query, _send_button(raw_payload))
             )
             await context.bot.send_message(query.from_user.id, "این مانهوا دیگه پیدا نشد.")
             return
@@ -524,7 +561,8 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch_count = await asyncio.to_thread(get_max_chapter, m["id"])
 
         # مشخصات از API تازه گرفته می‌شه؛ پس پست کانال همیشه آخرین اطلاعات رو داره
-        await send_manhwa(context.bot, CHANNEL_ID, m, genres_map, ch_count, preview=False)
+        await send_manhwa(context.bot, CHANNEL_ID, m, genres_map, ch_count, preview=False,
+                           new_from=new_from, new_to=new_to)
 
         published.add(key)
         await query.edit_message_reply_markup(reply_markup=_keyboard_with_row(
@@ -534,7 +572,7 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"خطا در ارسال به کانال: {e}")
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_keyboard_with_row(query, _send_button(mid))
+                reply_markup=_keyboard_with_row(query, _send_button(raw_payload))
             )
         except Exception:
             pass
@@ -758,7 +796,8 @@ def _check_once_locked(notify, now, full):
 
         if current_ch > last_ch:
             print(f"چپتر جدید برای {m['title']}: {last_ch} → {current_ch}")
-            notify(f"🔔 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}", m)
+            notify(f"🔔 چپتر جدید!\n\n{m['title']}\nاز چپتر {last_ch} به {current_ch}", m,
+                   new_from=last_ch + 1, new_to=current_ch)
             new_entry["hot_ts"] = now
         elif fp != entry.get("fp"):
             print(f"مشخصات تغییر کرد: {m['title']}")
@@ -788,11 +827,13 @@ async def run_manual_check(bot: Bot, chat_id, report_empty: bool = True):
     try:
         events = []
         first_run = await asyncio.to_thread(
-            check_once, lambda text, m: events.append((text, m)), None, True
+            check_once,
+            lambda text, m, new_from=None, new_to=None: events.append((text, m, new_from, new_to)),
+            None, True,
         )
-        for text, m in events:
+        for text, m, new_from, new_to in events:
             try:
-                await bot.send_message(chat_id, text, reply_markup=make_notify_keyboard(m))
+                await bot.send_message(chat_id, text, reply_markup=make_notify_keyboard(m, new_from, new_to))
             except Exception as e:
                 print(f"خطا در ارسال اطلاع‌رسانی: {e}")
             await asyncio.sleep(0.5)
@@ -836,8 +877,8 @@ def check_loop():
     asyncio.set_event_loop(loop)
     bot = Bot(BOT_TOKEN)
 
-    def notify(text, m):
-        kb = make_notify_keyboard(m)
+    def notify(text, m, new_from=None, new_to=None):
+        kb = make_notify_keyboard(m, new_from, new_to)
         for uid in ALLOWED_IDS:
             try:
                 loop.run_until_complete(bot.send_message(uid, text, reply_markup=kb))
