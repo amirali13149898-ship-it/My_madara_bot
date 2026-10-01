@@ -875,10 +875,20 @@ def parse_channel_post(text: str):
     if not text:
         return None
     base = parse_post(text)
+    # اولویت با خط «نحوه پیدا کردن : #اسم_فارسی #English_Name»
+    fa = en = None
+    m_tags = re.search(r"نحوه\s*پیدا\s*کردن\s*[:：]\s*(.+)", text)
+    if m_tags:
+        for t in re.findall(r"#([^\s#]+)", m_tags.group(1)):
+            name = t.replace("_", " ").strip()
+            if not fa and re.search(r"[\u0600-\u06FF]", name):
+                fa = name
+            elif not en and re.search(r"[A-Za-z]", name):
+                en = name
     m_fa = re.search(r"اسم\s*فارسی\s*مانهوا\s*[:：]\s*(.+)", text)
     m_en = re.search(r"اسم\s*انگلیسی\s*مانهوا\s*[:：]\s*(.+)", text)
-    fa = clean(m_fa.group(1)) if m_fa else base["fa"]
-    en = clean(m_en.group(1)) if m_en else base["en"]
+    fa = fa or (clean(m_fa.group(1)) if m_fa else base["fa"])
+    en = en or (clean(m_en.group(1)) if m_en else base["en"])
     if en in ("", "—", "-"):
         en = None
     if not fa:
