@@ -695,6 +695,13 @@ LIST_CHUNK = 3800      # سقف کاراکتر هر پیام (تلگرام: 4096
 LIST_MAX_ITEMS = 45    # سقف آیتم هر پیام (تلگرام: حداکثر ۱۰۰ موجودیت)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DATA_FILE = os.getenv("DATA_FILE", "manhwa_lists.json")
+LIST_END_LINK = os.getenv("LIST_END_LINK", "").strip()
+LIST_ONGOING_LINK = os.getenv("LIST_ONGOING_LINK", "").strip()
+
+
+def link_to_id(link):
+    m = re.search(r"/(\d+)/?(?:\?.*)?$", link or "")
+    return int(m.group(1)) if m else None
 
 
 def norm_key(s) -> str:
@@ -741,9 +748,10 @@ class Store:
                 cur.execute("CREATE TABLE IF NOT EXISTS manhwa_items (k TEXT PRIMARY KEY, fa TEXT, en TEXT, "
                             "ended BOOLEAN NOT NULL DEFAULT FALSE, ts DOUBLE PRECISION NOT NULL)")
                 cur.execute("CREATE TABLE IF NOT EXISTS manhwa_meta (k TEXT PRIMARY KEY, v TEXT)")
-                cur.execute("SELECT k, fa, en, ended, ts FROM manhwa_items")
-                for k, fa, en, ended, ts in cur.fetchall():
-                    self.items[k] = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": ts}
+                cur.execute("ALTER TABLE manhwa_items ADD COLUMN IF NOT EXISTS plain BOOLEAN NOT NULL DEFAULT FALSE")
+                cur.execute("SELECT k, fa, en, ended, ts, plain FROM manhwa_items")
+                for k, fa, en, ended, ts, plain in cur.fetchall():
+                    self.items[k] = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": ts, "plain": bool(plain)}
                 cur.execute("SELECT k, v FROM manhwa_meta")
                 self.meta = dict(cur.fetchall())
         finally:
@@ -774,10 +782,10 @@ class Store:
             try:
                 with conn, conn.cursor() as cur:
                     cur.execute(
-                        "INSERT INTO manhwa_items (k, fa, en, ended, ts) VALUES (%s,%s,%s,%s,%s) "
+                        "INSERT INTO manhwa_items (k, fa, en, ended, ts, plain) VALUES (%s,%s,%s,%s,%s,%s) "
                         "ON CONFLICT (k) DO UPDATE SET fa=EXCLUDED.fa, en=EXCLUDED.en, "
-                        "ended=EXCLUDED.ended, ts=EXCLUDED.ts",
-                        (it["k"], it["fa"], it.get("en"), it["ended"], it["ts"]))
+                        "ended=EXCLUDED.ended, ts=EXCLUDED.ts, plain=EXCLUDED.plain",
+                        (it["k"], it["fa"], it.get("en"), it["ended"], it["ts"], it.get("plain", False)))
             finally:
                 conn.close()
         except Exception as e:
@@ -815,7 +823,7 @@ class Store:
             k = norm_key(en) or norm_key(fa)
             if not k or not fa:
                 return None, False
-            it = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": time.time()}
+            it = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": time.time(), "plain": False}
             self.items[k] = it
             self.put_item(it)
             return it, True
@@ -823,15 +831,27 @@ class Store:
         if en and not it.get("en"):
             it["en"], changed = en, True
         if ended is True and not it["ended"]:
-            it["ended"], it["ts"], changed = True, time.time(), True
+            it["ended"], it["ts"], it["plain"], changed = True, time.time(), False, True
         if changed:
             self.put_item(it)
         return it, changed
 
     def set_status(self, it: dict, ended: bool):
         if it["ended"] != ended:
-            it["ended"], it["ts"] = ended, time.time()
+            it["ended"], it["ts"], it["plain"] = ended, time.time(), False
             self.put_item(it)
+
+    def add_old(self, fa, en, ended, ts):
+        """آیتم قدیمی (متن ساده). اگه از قبل بود None برمی‌گردونه."""
+        if self.find(en, fa):
+            return None
+        k = norm_key(en) or norm_key(fa)
+        if not k:
+            return None
+        it = {"k": k, "fa": fa, "en": en, "ended": ended, "ts": ts, "plain": True}
+        self.items[k] = it
+        self.put_item(it)
+        return it
 
     def by_kid(self, kid: str):
         return next((x for x in self.items.values() if _kid(x["k"]) == kid), None)
@@ -893,7 +913,8 @@ def build_list_messages(entries: list, title: str) -> list:
             text, ents, count = head(part) + "\n\n", [], 0
         if count:
             text += "\n"
-        ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text), length=_u16(block)))
+        if not e.get("plain"):
+            ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text), length=_u16(block)))
         text += block
         count += 1
     if not count:
@@ -908,8 +929,17 @@ _refresh_lock = asyncio.Lock()
 async def _sync_category(bot, ended: bool):
     st = get_store()
     key = "msgs_end" if ended else "msgs_on"
-    msgs = build_list_messages(st.entries(ended), LIST_TITLE_END if ended else LIST_TITLE_ON)
+    title = st.meta.get("title_end" if ended else "title_on") or (LIST_TITLE_END if ended else LIST_TITLE_ON)
+    msgs = build_list_messages(st.entries(ended), title)
     ids = json.loads(st.meta.get(key) or "[]")
+    link_id = link_to_id(LIST_END_LINK if ended else LIST_ONGOING_LINK)
+    if link_id:
+        if not st.meta.get("imp_" + key):
+            raise RuntimeError(f"لیست «{_st_label(ended)}»: اول پیام لیست فعلی رو تو «افزودن مانهواهای قبلی» فوروارد کن.")
+        if not ids or ids[0] != link_id:
+            ids = [link_id]
+    if not ids:
+        raise RuntimeError(f"لینک پیام لیست «{_st_label(ended)}» تو Render تنظیم نشده.")
     new_ids = []
     for i, (text, ents) in enumerate(msgs):
         mid = ids[i] if i < len(ids) else None
@@ -922,6 +952,8 @@ async def _sync_category(bot, ended: bool):
                 if "not modified" in str(e).lower():
                     new_ids.append(mid)
                     continue
+                if i == 0:
+                    raise RuntimeError(f"ادیت پیام لیست {mid} نشد: {e}")
                 print(f"ادیت پیام لیست {mid} نشد، پیام جدید می‌فرستم: {e}")
         sent = await bot.send_message(CHANNEL_ID, text, entities=ents)
         new_ids.append(sent.message_id)
@@ -935,8 +967,14 @@ async def _sync_category(bot, ended: bool):
 
 async def refresh_lists(bot):
     async with _refresh_lock:
-        await _sync_category(bot, True)
-        await _sync_category(bot, False)
+        errs = []
+        for ended in (True, False):
+            try:
+                await _sync_category(bot, ended)
+            except Exception as e:
+                errs.append(str(e))
+        if errs:
+            raise RuntimeError("\n".join(errs))
 
 
 async def register_info(bot, info: dict):
@@ -965,7 +1003,57 @@ def _st_label(ended: bool) -> str:
     return "🔚 پایان یافته" if ended else "🔄 در حال ترجمه"
 
 
+def parse_list_message(text: str):
+    """(ended, title, [(fa, en)]) از متن پیام لیست؛ اگه لیست نبود None."""
+    items, cur, title = [], None, None
+    for l in (text or "").splitlines():
+        l = l.strip()
+        if not l:
+            continue
+        m = re.match(r"^[0-9۰-۹٠-٩]+\s*[.)\-:]?\s*(#.*)$", l)
+        if m:
+            cur = re.findall(r"#([^\s#]+)", m.group(1))
+            items.append(cur)
+        elif l.startswith("#") and cur is not None:
+            cur.extend(re.findall(r"#([^\s#]+)", l))
+        elif not items:
+            title = title or re.sub(r"\s*\(بخش\s*\d+\)\s*$", "", l)
+        else:
+            cur = None
+    if not items:
+        return None
+    pairs = []
+    for tags in items:
+        names = [t.replace("_", " ") for t in tags]
+        fa = next((n for n in names if re.search(r"[\u0600-\u06FF]", n)), None)
+        en = next((n for n in names if n is not fa and re.search(r"[A-Za-z]", n)), None)
+        if fa or en:
+            pairs.append((fa, en))
+    t = title or ""
+    ended = True if ("پایان" in t or "تمام" in t) else False if ("در حال" in t or "ترجمه" in t) else None
+    return ended, title, pairs
+
+
 async def handle_import(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
+    lst = parse_list_message(text)
+    if lst:
+        ended, title, pairs = lst
+        if ended is None:
+            await msg.reply_text("شبیه لیسته ولی از عنوانش نفهمیدم پایان‌یافته‌ست یا در حال ترجمه (عنوان باید «پایان» یا «در حال ترجمه» داشته باشه).")
+            return
+        st = get_store()
+        base = float(len([x for x in st.items.values() if x.get("plain") and x["ended"] == ended]))
+        added = dup = 0
+        for i, (fa, en) in enumerate(pairs):
+            if st.add_old(fa, en, ended, base + i):
+                added += 1
+            else:
+                dup += 1
+        st.set_meta("imp_msgs_end" if ended else "imp_msgs_on", "1")
+        if title:
+            st.set_meta("title_end" if ended else "title_on", title)
+        await msg.reply_text(f"✅ لیست {_st_label(ended)}: {added} مورد ثبت شد، {dup} تکراری رد شد.")
+        return
     info = parse_channel_post(text)
     if not info:
         await msg.reply_text("اسم مانهوا رو از این پست پیدا نکردم (خط «مانهوا: ...» یا «اسم فارسی مانهوا: ...» لازمه).")
