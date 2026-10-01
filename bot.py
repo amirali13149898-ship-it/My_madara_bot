@@ -177,8 +177,10 @@ def build_caption(d: dict, max_len: int) -> str:
 
 def channel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 بازکردن سایت", url=SITE_ROOT)],
-        [InlineKeyboardButton("📚 آرشیو مانهواها", url=ARCHIVE_URL)],
+        [
+            InlineKeyboardButton("🌐 بازکردن سایت", url=SITE_ROOT),
+            InlineKeyboardButton("📚 آرشیو مانهواها", url=ARCHIVE_URL),
+        ],
     ])
 
 
