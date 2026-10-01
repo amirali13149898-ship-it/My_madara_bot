@@ -264,7 +264,7 @@ def panel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[BTN_NEW], [BTN_MANUAL], [BTN_HELP, BTN_CANCEL]],
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,
         input_field_placeholder="یکی از گزینه‌ها رو انتخاب کن...",
     )
 
