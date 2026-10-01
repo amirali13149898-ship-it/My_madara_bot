@@ -1,6 +1,8 @@
 import os
 import re
 import io
+import json
+import hashlib
 import html as htmllib
 import time
 import asyncio
@@ -8,6 +10,7 @@ import threading
 import requests
 from urllib.parse import urljoin
 from flask import Flask
+from telegram.error import BadRequest
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -351,7 +354,9 @@ HELP_TEXT = (
     "✍️ «ساخت دستی»: همه‌چیز رو مرحله‌به‌مرحله ازت می‌پرسم.\n\n"
     "تو هر دو حالت، ژانرها (اگه تو پست نبود)، تعداد چپترها و وضعیت پخش رو ازت می‌پرسم. "
     "بعد پیش‌نمایش میاد و با «📢 ارسال به کانال» منتشر می‌شه.\n\n"
-    "/start → باز کردن پنل\n/cancel → لغو پست فعلی"
+    "📥 «افزودن مانهواهای قبلی»: پست‌های قدیمی کانال رو یکی‌یکی فوروارد کن تا تو لیست‌ها ثبت بشن؛ آخرش «ثبت و به‌روزرسانی لیست‌ها».\n\n"
+    "پست‌های جدید خودکار تو لیست «پایان یافته» یا «در حال ترجمه» میرن و وقتی یه مانهوا تموم شد از لیست دوم به اولی منتقل می‌شه.\n\n"
+    "/start → باز کردن پنل\n/cancel → لغو پست فعلی\n/refresh → به‌روزرسانی لیست‌ها"
 )
 PANEL_TEXT = "🎛 پنل پست‌سازی فعال شد.\nاز دکمه‌های پایین صفحه یکی رو انتخاب کن 👇"
 
@@ -359,13 +364,15 @@ BTN_NEW = "📩 ساخت پست از روی پست"
 BTN_MANUAL = "✍️ ساخت دستی"
 BTN_HELP = "📖 راهنما"
 BTN_CANCEL = "❌ لغو پست فعلی"
-PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL}
+BTN_IMPORT = "📥 افزودن مانهواهای قبلی به لیست"
+BTN_REFRESH = "🔄 ثبت و به‌روزرسانی لیست‌ها"
+PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL, BTN_IMPORT, BTN_REFRESH}
 
 
 def panel_keyboard() -> ReplyKeyboardMarkup:
     """پنل کیبوردی ثابت (دکمه‌های پایین صفحه، کنار جای تایپ)."""
     return ReplyKeyboardMarkup(
-        [[BTN_NEW], [BTN_MANUAL], [BTN_HELP, BTN_CANCEL]],
+        [[BTN_NEW], [BTN_MANUAL], [BTN_IMPORT], [BTN_REFRESH], [BTN_HELP, BTN_CANCEL]],
         resize_keyboard=True,
         is_persistent=False,
         input_field_placeholder="یکی از گزینه‌ها رو انتخاب کن...",
@@ -382,6 +389,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("شما مجاز به استفاده از این بات نیستید.")
         return
     context.user_data.pop("draft", None)
+    context.user_data.pop("import", None)
     await update.message.reply_text(PANEL_TEXT, reply_markup=panel_keyboard())
 
 
@@ -389,10 +397,29 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     context.user_data.pop("draft", None)
+    context.user_data.pop("import", None)
     await update.message.reply_text("لغو شد ✅", reply_markup=panel_keyboard())
 
 
+async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await do_refresh(update.message, context)
+
+
 async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if text == BTN_REFRESH:
+        await do_refresh(msg, context)
+        return
+    if text == BTN_IMPORT:
+        context.user_data.pop("draft", None)
+        context.user_data["import"] = {"n": 0}
+        await msg.reply_text(
+            "📥 حالت افزودن روشنه.\nپست‌های قدیمی کانال رو (با کپشن) یکی‌یکی برام فوروارد کن.\n"
+            "وقتی تموم شد «🔄 ثبت و به‌روزرسانی لیست‌ها» رو بزن.",
+            reply_markup=panel_keyboard())
+        return
+    context.user_data.pop("import", None)
     if text == BTN_NEW:
         context.user_data["draft"] = {"step": "await_post"}
         await msg.reply_text(
@@ -422,6 +449,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = msg.photo[-1].file_id if msg.photo else None
     if text in PANEL_BUTTONS:
         await handle_panel_button(msg, context, text)
+        return
+
+    if context.user_data.get("import") is not None:
+        if text:
+            await handle_import(msg, context, text)
         return
 
     d = context.user_data.get("draft")
@@ -561,6 +593,12 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=channel_keyboard(),
         )
         published.add(key)
+        try:
+            info = parse_channel_post(query.message.caption or query.message.text or "")
+            if info:
+                await register_info(context.bot, info)
+        except Exception as e:
+            print(f"ثبت تو لیست بعد از انتشار نشد: {e}")
         await query.edit_message_reply_markup(reply_markup=_keyboard_with_row(
             query, [InlineKeyboardButton("✅ به کانال ارسال شد", callback_data="noop")]
         ))
@@ -604,6 +642,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     msg = update.channel_post
     if not msg or not _is_our_channel(msg.chat):
         return
+    await _auto_register(msg, context.bot)
     want_button = BUTTON_ENABLED and bool(BUTTON_URL)
     if not FOOTER_TEXT and not want_button:
         return
@@ -648,20 +687,360 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         print(f"خطا در ادیت پیام {mid}: {e}")
 
 
+
+# ================== لیست‌های خودکار (پایان‌یافته / در حال ترجمه) ==================
+LIST_TITLE_END = os.getenv("LIST_TITLE_ENDED", "مانهوا های پایان یافته سایت").strip()
+LIST_TITLE_ON = os.getenv("LIST_TITLE_ONGOING", "مانهوا های در حال ترجمه سایت").strip()
+LIST_CHUNK = 3800      # سقف کاراکتر هر پیام (تلگرام: 4096)
+LIST_MAX_ITEMS = 45    # سقف آیتم هر پیام (تلگرام: حداکثر ۱۰۰ موجودیت)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATA_FILE = os.getenv("DATA_FILE", "manhwa_lists.json")
+
+
+def norm_key(s) -> str:
+    s = (s or "").lower().replace("ي", "ی").replace("ك", "ک")
+    return re.sub(r"[\W_]+", "", s)
+
+
+def list_tag(name) -> str:
+    t = re.sub(r"[^\w\u200c]+", "_", name or "")
+    t = re.sub(r"_+", "_", t).strip("_")
+    return f"#{t}" if t else ""
+
+
+def _kid(k: str) -> str:
+    return hashlib.md5(k.encode("utf-8")).hexdigest()[:10]
+
+
+class Store:
+    """نگهداری لیست مانهواها: Postgres (DATABASE_URL) یا در غیر این‌صورت فایل JSON."""
+
+    def __init__(self):
+        self.items = {}   # key -> {"k","fa","en","ended","ts"}
+        self.meta = {}
+        self.pg = bool(DATABASE_URL)
+        if self.pg:
+            try:
+                self._pg_init()
+            except Exception as e:
+                print(f"اتصال به دیتابیس نشد، می‌رم روی فایل JSON: {e}")
+                self.pg = False
+        if not self.pg:
+            print("⚠️ DATABASE_URL تنظیم نیست؛ داده تو فایل JSON ذخیره می‌شه (روی Render با هر دیپلوی پاک می‌شه!)")
+            self._file_load()
+
+    # ---- Postgres ----
+    def _conn(self):
+        import psycopg2
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+    def _pg_init(self):
+        conn = self._conn()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS manhwa_items (k TEXT PRIMARY KEY, fa TEXT, en TEXT, "
+                            "ended BOOLEAN NOT NULL DEFAULT FALSE, ts DOUBLE PRECISION NOT NULL)")
+                cur.execute("CREATE TABLE IF NOT EXISTS manhwa_meta (k TEXT PRIMARY KEY, v TEXT)")
+                cur.execute("SELECT k, fa, en, ended, ts FROM manhwa_items")
+                for k, fa, en, ended, ts in cur.fetchall():
+                    self.items[k] = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": ts}
+                cur.execute("SELECT k, v FROM manhwa_meta")
+                self.meta = dict(cur.fetchall())
+        finally:
+            conn.close()
+
+    # ---- فایل ----
+    def _file_load(self):
+        try:
+            with open(DATA_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self.items, self.meta = data.get("items", {}), data.get("meta", {})
+        except Exception:
+            pass
+
+    def _file_save(self):
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"items": self.items, "meta": self.meta}, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"ذخیره‌ی فایل نشد: {e}")
+
+    # ---- ذخیره ----
+    def put_item(self, it: dict):
+        if not self.pg:
+            return self._file_save()
+        try:
+            conn = self._conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO manhwa_items (k, fa, en, ended, ts) VALUES (%s,%s,%s,%s,%s) "
+                        "ON CONFLICT (k) DO UPDATE SET fa=EXCLUDED.fa, en=EXCLUDED.en, "
+                        "ended=EXCLUDED.ended, ts=EXCLUDED.ts",
+                        (it["k"], it["fa"], it.get("en"), it["ended"], it["ts"]))
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"ذخیره تو دیتابیس نشد: {e}")
+
+    def set_meta(self, k: str, v: str):
+        self.meta[k] = v
+        if not self.pg:
+            return self._file_save()
+        try:
+            conn = self._conn()
+            try:
+                with conn, conn.cursor() as cur:
+                    cur.execute("INSERT INTO manhwa_meta (k, v) VALUES (%s,%s) "
+                                "ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", (k, v))
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"ذخیره‌ی meta نشد: {e}")
+
+    # ---- منطق ----
+    def find(self, en, fa):
+        ek, fk = norm_key(en), norm_key(fa)
+        for it in self.items.values():
+            if (ek and ek == norm_key(it.get("en"))) or (fk and fk == norm_key(it.get("fa"))):
+                return it
+        return None
+
+    def upsert(self, info: dict):
+        """(آیتم, تغییر_کرد). هر مانهوا فقط یک بار و فقط تو یکی از دو لیست هست.
+        وضعیت فقط از «در حال ترجمه» به «پایان یافته» خودکار تغییر می‌کنه."""
+        fa, en, ended = info.get("fa"), info.get("en"), info.get("ended")
+        it = self.find(en, fa)
+        if it is None:
+            k = norm_key(en) or norm_key(fa)
+            if not k or not fa:
+                return None, False
+            it = {"k": k, "fa": fa, "en": en, "ended": bool(ended), "ts": time.time()}
+            self.items[k] = it
+            self.put_item(it)
+            return it, True
+        changed = False
+        if en and not it.get("en"):
+            it["en"], changed = en, True
+        if ended is True and not it["ended"]:
+            it["ended"], it["ts"], changed = True, time.time(), True
+        if changed:
+            self.put_item(it)
+        return it, changed
+
+    def set_status(self, it: dict, ended: bool):
+        if it["ended"] != ended:
+            it["ended"], it["ts"] = ended, time.time()
+            self.put_item(it)
+
+    def by_kid(self, kid: str):
+        return next((x for x in self.items.values() if _kid(x["k"]) == kid), None)
+
+    def entries(self, ended: bool) -> list:
+        return sorted((x for x in self.items.values() if x["ended"] == ended), key=lambda x: x["ts"])
+
+
+_store = None
+
+
+def get_store() -> Store:
+    global _store
+    if _store is None:
+        _store = Store()
+    return _store
+
+
+def parse_channel_post(text: str):
+    """اسم فارسی/انگلیسی و وضعیت رو از کپشن پست کانال درمیاره. اگه مانهوایی نبود None."""
+    if not text:
+        return None
+    base = parse_post(text)
+    m_fa = re.search(r"اسم\s*فارسی\s*مانهوا\s*[:：]\s*(.+)", text)
+    m_en = re.search(r"اسم\s*انگلیسی\s*مانهوا\s*[:：]\s*(.+)", text)
+    fa = clean(m_fa.group(1)) if m_fa else base["fa"]
+    en = clean(m_en.group(1)) if m_en else base["en"]
+    if en in ("", "—", "-"):
+        en = None
+    if not fa:
+        return None
+    ended = None
+    m_st = re.search(r"وضعیت\s*پخش\s*[:：]\s*(.+)", text)
+    if m_st:
+        s = m_st.group(1)
+        if "پایان" in s or "تمام" in s:
+            ended = True
+        elif "ادامه" in s or "در حال" in s or "انتشار" in s:
+            ended = False
+    if ended is None:
+        if "🔚" in text:
+            ended = True
+        elif "🔄" in text:
+            ended = False
+    return {"fa": fa, "en": en, "ended": ended}
+
+
+def build_list_messages(entries: list, title: str) -> list:
+    """[(متن, entities)] — هر آیتم داخل یه نقل‌قول، شماره‌ی پیوسته بین پیام‌ها."""
+    msgs, part = [], 1
+    head = lambda p: title if p == 1 else f"{title} (بخش {p})"
+    text, ents, count = head(part) + "\n\n", [], 0
+    for n, e in enumerate(entries, 1):
+        tags = [t for t in (list_tag(e.get("fa")), list_tag(e.get("en"))) if t]
+        block = f"{n}." + "\n".join(tags)
+        if count and (len(text) + len(block) + 1 > LIST_CHUNK or count >= LIST_MAX_ITEMS):
+            msgs.append((text, ents or None))
+            part += 1
+            text, ents, count = head(part) + "\n\n", [], 0
+        if count:
+            text += "\n"
+        ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text), length=_u16(block)))
+        text += block
+        count += 1
+    if not count:
+        text += "فعلاً موردی نیست."
+    msgs.append((text, ents or None))
+    return msgs
+
+
+_refresh_lock = asyncio.Lock()
+
+
+async def _sync_category(bot, ended: bool):
+    st = get_store()
+    key = "msgs_end" if ended else "msgs_on"
+    msgs = build_list_messages(st.entries(ended), LIST_TITLE_END if ended else LIST_TITLE_ON)
+    ids = json.loads(st.meta.get(key) or "[]")
+    new_ids = []
+    for i, (text, ents) in enumerate(msgs):
+        mid = ids[i] if i < len(ids) else None
+        if mid:
+            try:
+                await bot.edit_message_text(chat_id=CHANNEL_ID, message_id=mid, text=text, entities=ents)
+                new_ids.append(mid)
+                continue
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    new_ids.append(mid)
+                    continue
+                print(f"ادیت پیام لیست {mid} نشد، پیام جدید می‌فرستم: {e}")
+        sent = await bot.send_message(CHANNEL_ID, text, entities=ents)
+        new_ids.append(sent.message_id)
+    for mid in ids[len(msgs):]:
+        try:
+            await bot.delete_message(CHANNEL_ID, mid)
+        except Exception as e:
+            print(f"حذف پیام اضافه‌ی لیست نشد: {e}")
+    st.set_meta(key, json.dumps(new_ids))
+
+
+async def refresh_lists(bot):
+    async with _refresh_lock:
+        await _sync_category(bot, True)
+        await _sync_category(bot, False)
+
+
+async def register_info(bot, info: dict):
+    it, changed = get_store().upsert(info)
+    if it and changed:
+        await refresh_lists(bot)
+    return it, changed
+
+
+async def _auto_register(msg, bot):
+    try:
+        info = parse_channel_post(msg.text or msg.caption or "")
+        if info:
+            await register_info(bot, info)
+    except Exception as e:
+        print(f"ثبت خودکار تو لیست نشد: {e}")
+
+
+async def channel_edit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.edited_channel_post
+    if msg and _is_our_channel(msg.chat):
+        await _auto_register(msg, context.bot)
+
+
+def _st_label(ended: bool) -> str:
+    return "🔚 پایان یافته" if ended else "🔄 در حال ترجمه"
+
+
+async def handle_import(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
+    info = parse_channel_post(text)
+    if not info:
+        await msg.reply_text("اسم مانهوا رو از این پست پیدا نکردم (خط «مانهوا: ...» یا «اسم فارسی مانهوا: ...» لازمه).")
+        return
+    it, changed = get_store().upsert(info)
+    if not it:
+        await msg.reply_text("ثبت نشد.")
+        return
+    context.user_data["import"]["n"] += 1
+    if info["ended"] is None and changed:
+        kid = _kid(it["k"])
+        await msg.reply_text(
+            f"❓ وضعیت «{it['fa']}» تو پست نبود. کدوم؟",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔚 پایان یافته", callback_data=f"setst:{kid}:1"),
+                InlineKeyboardButton("🔄 در حال ترجمه", callback_data=f"setst:{kid}:0"),
+            ]]))
+        return
+    tag = "اضافه شد" if changed else "از قبل بود"
+    await msg.reply_text(f"✅ {it['fa']} → {_st_label(it['ended'])} ({tag})")
+
+
+async def setst_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_allowed(q.from_user.id):
+        await q.answer()
+        return
+    _, kid, flag = q.data.split(":")
+    st = get_store()
+    it = st.by_kid(kid)
+    if not it:
+        await q.answer("پیدا نشد.", show_alert=True)
+        return
+    st.set_status(it, flag == "1")
+    await q.answer("ثبت شد ✅")
+    await q.edit_message_text(f"✅ {it['fa']} → {_st_label(it['ended'])}")
+    if context.user_data.get("import") is None:
+        try:
+            await refresh_lists(context.bot)
+        except Exception as e:
+            print(f"به‌روزرسانی لیست نشد: {e}")
+
+
+async def do_refresh(msg, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("import", None)
+    await msg.reply_text("⏳ در حال به‌روزرسانی لیست‌های کانال...", reply_markup=panel_keyboard())
+    st = get_store()
+    try:
+        await refresh_lists(context.bot)
+        await msg.reply_text(
+            f"✅ لیست‌ها به‌روز شد.\n🔚 پایان یافته: {len(st.entries(True))}\n🔄 در حال ترجمه: {len(st.entries(False))}",
+            reply_markup=panel_keyboard())
+    except Exception as e:
+        await msg.reply_text(
+            f"❌ به‌روزرسانی ناموفق بود:\n{e}\n\nچک کن بات تو کانال ادمین باشه و دسترسی ارسال و ویرایش پیام داشته باشه.",
+            reply_markup=panel_keyboard())
+
+
 # ================== اجرا ==================
 def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("refresh", refresh_cmd))
 
     application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^st_(on|end)$"))
     application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub$"))
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
     application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno$"))
     application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
+    application.add_handler(CallbackQueryHandler(setst_callback, pattern=r"^setst:"))
 
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_handler))
+    application.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST, channel_edit_handler))
     application.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.PHOTO), on_message
     ))
