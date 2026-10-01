@@ -1,10 +1,14 @@
 import os
 import re
+import io
+import html as htmllib
 import time
 import asyncio
 import threading
+import requests
+from urllib.parse import urljoin
 from flask import Flask
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
@@ -143,6 +147,72 @@ def parse_post(text: str) -> dict:
     return d
 
 
+
+# ================== کاور از لینک (پیش‌نمایش لینک) ==================
+_UA = {"User-Agent": "Mozilla/5.0"}
+_OG_RES = [
+    re.compile(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*content=["\']([^"\']+)', re.I),
+    re.compile(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']', re.I),
+]
+
+
+def extract_urls(msg) -> list:
+    """لینک‌های پیام به ترتیب (تلگرام پیش‌نمایش رو از اولین لینک می‌سازه)."""
+    urls = []
+    lp = getattr(msg, "link_preview_options", None)
+    if lp and getattr(lp, "url", None):
+        urls.append(lp.url)
+    types = [MessageEntity.URL, MessageEntity.TEXT_LINK]
+    try:
+        ents = msg.parse_entities(types=types) if msg.text else msg.parse_caption_entities(types=types)
+    except Exception:
+        ents = {}
+    for e, t in sorted(ents.items(), key=lambda kv: kv[0].offset):
+        u = e.url if e.type == MessageEntity.TEXT_LINK else t
+        if u and not re.match(r"^https?://", u):
+            u = "https://" + u
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
+def fetch_cover_from_url(url: str):
+    """اگه لینک خودش عکسه همونو برمی‌گردونه، اگه صفحه‌ست عکس og:image/twitter:image رو دانلود می‌کنه."""
+    r = requests.get(url, headers=_UA, timeout=20)
+    r.raise_for_status()
+    if r.headers.get("Content-Type", "").lower().startswith("image/"):
+        return r.content if len(r.content) < 15_000_000 else None
+    page = r.text
+    img_url = None
+    for rx in _OG_RES:
+        m = rx.search(page)
+        if m:
+            img_url = urljoin(r.url, htmllib.unescape(m.group(1)))
+            break
+    if not img_url:
+        return None
+    r2 = requests.get(img_url, headers=_UA, timeout=25)
+    r2.raise_for_status()
+    return r2.content if len(r2.content) < 15_000_000 else None
+
+
+def _to_jpeg_bytes(data: bytes) -> bytes:
+    from PIL import Image
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img.thumbnail((2000, 2000))
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
+
+async def get_cover(url: str):
+    try:
+        return await asyncio.to_thread(fetch_cover_from_url, url)
+    except Exception as e:
+        print(f"دریافت کاور از لینک نشد ({url}): {e}")
+        return None
+
+
 # ================== ساخت پست ==================
 def build_caption(d: dict, max_len: int) -> str:
     fa = d["fa"]
@@ -200,10 +270,21 @@ def _keyboard_with_row(query, buttons: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+async def send_photo_safe(bot, chat_id, photo, caption, kb):
+    try:
+        return await bot.send_photo(chat_id, photo, caption=caption, reply_markup=kb)
+    except Exception as e:
+        if isinstance(photo, (bytes, bytearray)):
+            print(f"ارسال مستقیم عکس نشد ({e})؛ تبدیل به JPEG...")
+            jpg = await asyncio.to_thread(_to_jpeg_bytes, bytes(photo))
+            return await bot.send_photo(chat_id, jpg, caption=caption, reply_markup=kb)
+        raise
+
+
 async def send_preview(bot, chat_id, d: dict):
     kb = preview_keyboard()
     if d.get("photo"):
-        await bot.send_photo(chat_id, d["photo"], caption=build_caption(d, CAPTION_LIMIT), reply_markup=kb)
+        await send_photo_safe(bot, chat_id, d["photo"], build_caption(d, CAPTION_LIMIT), kb)
     else:
         await bot.send_message(chat_id, build_caption(d, TEXT_LIMIT), reply_markup=kb)
 
@@ -329,8 +410,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d["photo"] = photo
         elif text in ("-", "ندارد", "بدون"):
             d["photo"] = None
+        elif re.match(r"^(https?://|t\.me/)\S+$", text):
+            img = await get_cover(text if text.startswith("http") else "https://" + text)
+            if not img:
+                await msg.reply_text("از این لینک عکسی درنیومد. عکس رو مستقیم بفرست، یا برای رد کردن: -")
+                return
+            d["photo"] = img
         else:
-            await msg.reply_text("عکس کاور رو بفرست، یا برای رد کردن: -")
+            await msg.reply_text("عکس کاور (یا لینکش) رو بفرست، یا برای رد کردن: -")
             return
         await ask_next(context.bot, chat_id, d)
         return
@@ -340,12 +427,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d = parse_post(text)
         if photo:
             d["photo"] = photo
+        else:
+            urls = extract_urls(msg)
+            if urls:
+                img = await get_cover(urls[0])
+                if img:
+                    d["photo"] = img
         context.user_data["draft"] = d
         found = []
         found.append(f"فارسی: {d['fa']}" if d["fa"] else "فارسی: ❌")
         found.append(f"انگلیسی: {d['en']}" if d["en"] else "انگلیسی: ❌")
         found.append("خلاصه: ✅" if d["summary"] else "خلاصه: ❌")
-        found.append("کاور: ✅" if photo else "کاور: ❌")
+        found.append("کاور: ✅" if d.get("photo") else "کاور: ❌")
         if d["genres"]:
             found.append("ژانر: " + "، ".join(d["genres"]))
         await msg.reply_text("این‌ها رو از پست برداشتم:\n" + "\n".join(found))
