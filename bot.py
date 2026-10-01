@@ -242,27 +242,79 @@ async def ask_next(bot, chat_id, d: dict):
 
 # ================== دستورات ==================
 HELP_TEXT = (
-    "سلام ارباب 👑\n\n"
-    "یه پست کانال (با عکس و متن) برام فوروارد کن یا متنش رو بفرست؛ "
+    "📖 راهنما:\n\n"
+    "📩 «از روی پست»: یه پست کانال (با عکس و متن) برام فوروارد کن یا متنش رو بفرست؛ "
     "اسم فارسی و انگلیسی، خلاصه و کاور رو خودم برمی‌دارم.\n"
-    "فقط ژانرها (اگه تو پست نبود)، تعداد چپترها و وضعیت پخش رو ازت می‌پرسم، "
-    "بعد پیش‌نمایش پست میاد و با «📢 ارسال به کانال» تو کانال منتشر می‌شه.\n\n"
-    "/cancel → لغو پست فعلی"
+    "✍️ «ساخت دستی»: همه‌چیز رو مرحله‌به‌مرحله ازت می‌پرسم.\n\n"
+    "تو هر دو حالت، ژانرها (اگه تو پست نبود)، تعداد چپترها و وضعیت پخش رو ازت می‌پرسم. "
+    "بعد پیش‌نمایش میاد و با «📢 ارسال به کانال» منتشر می‌شه.\n\n"
+    "/start → باز کردن پنل\n/cancel → لغو پست فعلی"
 )
+PANEL_TEXT = "🎛 پنل پست‌سازی\nیکی رو انتخاب کن:"
+
+
+def panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 ساخت پست از روی پست", callback_data="pn_new")],
+        [InlineKeyboardButton("✍️ ساخت دستی", callback_data="pn_manual")],
+        [
+            InlineKeyboardButton("📖 راهنما", callback_data="pn_help"),
+            InlineKeyboardButton("❌ لغو پست فعلی", callback_data="pn_cancel"),
+        ],
+    ])
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت به پنل", callback_data="pn_menu")]])
+
+
+def empty_draft() -> dict:
+    return {"fa": None, "en": None, "summary": None, "genres": None, "rating": None,
+            "chapters": None, "status": None, "ended": None}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("شما مجاز به استفاده از این بات نیستید.")
         return
-    await update.message.reply_text(HELP_TEXT)
+    context.user_data.pop("draft", None)
+    await update.message.reply_text(PANEL_TEXT, reply_markup=panel_keyboard())
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     context.user_data.pop("draft", None)
-    await update.message.reply_text("لغو شد ✅")
+    await update.message.reply_text("لغو شد ✅\n\n" + PANEL_TEXT, reply_markup=panel_keyboard())
+
+
+async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(query.from_user.id):
+        return
+    action = query.data[3:]
+
+    if action == "new":
+        context.user_data["draft"] = {"step": "await_post"}
+        await query.edit_message_text(
+            "📩 پست کانال رو (با عکس و متن) برام فوروارد کن، یا متنش رو بفرست.\n"
+            "متن باید خط «مانهوا: ...» داشته باشه.",
+            reply_markup=back_keyboard(),
+        )
+    elif action == "manual":
+        d = empty_draft()
+        context.user_data["draft"] = d
+        await query.edit_message_text("✍️ ساخت دستی شروع شد.")
+        await ask_next(context.bot, query.message.chat_id, d)
+    elif action == "help":
+        await query.edit_message_text(HELP_TEXT, reply_markup=back_keyboard())
+    elif action == "cancel":
+        context.user_data.pop("draft", None)
+        await query.edit_message_text("لغو شد ✅\n\n" + PANEL_TEXT, reply_markup=panel_keyboard())
+    else:  # menu
+        context.user_data.pop("draft", None)
+        await query.edit_message_text(PANEL_TEXT, reply_markup=panel_keyboard())
 
 
 # ================== دریافت پیام‌ها ==================
@@ -320,7 +372,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_next(context.bot, chat_id, d)
         return
 
-    await msg.reply_text("یه پست مانهوا (با خط «مانهوا: ...») برام بفرست یا فوروارد کن. راهنما: /start")
+    if d and d.get("step") == "await_post":
+        await msg.reply_text("خط «مانهوا: ...» تو متن پیدا نشد. پست رو دوباره فوروارد کن یا از «ساخت دستی» استفاده کن.",
+                             reply_markup=panel_keyboard())
+        return
+    await msg.reply_text(PANEL_TEXT, reply_markup=panel_keyboard())
 
 
 async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -397,6 +453,9 @@ async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=_keyboard_with_row(
             query, [InlineKeyboardButton("✅ به کانال ارسال شد", callback_data="noop")]
         ))
+        context.user_data.pop("draft", None)
+        await context.bot.send_message(query.from_user.id, "پست تو کانال منتشر شد ✅\n\n" + PANEL_TEXT,
+                                       reply_markup=panel_keyboard())
     except Exception as e:
         print(f"خطا در ارسال به کانال: {e}")
         try:
@@ -480,6 +539,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cancel", cancel))
 
+    application.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^pn_(new|manual|help|cancel|menu)$"))
     application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^st_(on|end)$"))
     application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub$"))
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
