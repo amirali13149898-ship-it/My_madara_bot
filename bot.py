@@ -28,6 +28,7 @@ ARCHIVE_URL = os.getenv("ARCHIVE_URL", SITE_ROOT.rstrip("/") + "/manhwas").strip
 
 # فوتر و دکمه‌ی خودکار زیر پیام‌هایی که دستی تو کانال می‌ذاری (مثل قبل)
 FOOTER_TEXT = os.getenv("CHANNEL_FOOTER", "").strip()
+FOOTER_QUOTE = os.getenv("CHANNEL_FOOTER_QUOTE", "1").strip() != "0"
 BUTTON_ENABLED = os.getenv("CHANNEL_BUTTON_ENABLED", "1").strip() != "0"
 BUTTON_TEXT = os.getenv("CHANNEL_BUTTON_TEXT", "🌐 بازکردن سایت").strip()
 BUTTON_URL = os.getenv("CHANNEL_BUTTON_URL", SITE_ROOT).strip()
@@ -233,7 +234,7 @@ def build_caption(d: dict, max_len: int) -> str:
             f"نحوه پیدا کردن : {fa_tag} {en_tag}\n"
             f"خلاصه :\n«{summ}»\n\n"
             f"{chapter_line}\n\n"
-            f"🗣️{CHANNEL_TAG}\n{en_tag}"
+            f"{footer_line()}\n{en_tag}"
         )
 
     summary = (d.get("summary") or "—").strip()
@@ -243,6 +244,25 @@ def build_caption(d: dict, max_len: int) -> str:
         summary = summary[: max(0, len(summary) - cut)].rstrip() + "..."
         caption = build(summary)
     return caption
+
+
+
+def footer_line() -> str:
+    return f"🗣️{CHANNEL_TAG}"
+
+
+def _u16(text: str) -> int:
+    """طول متن بر حسب UTF-16 (واحدی که تلگرام برای offset موجودیت‌ها استفاده می‌کنه)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def quote_entities(text: str):
+    """خط فوتر (🗣️@کانال) رو داخل نقل‌قول (blockquote) می‌ذاره."""
+    marker = footer_line()
+    idx = text.rfind(marker)
+    if idx < 0:
+        return None
+    return [MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text[:idx]), length=_u16(marker))]
 
 
 def channel_keyboard() -> InlineKeyboardMarkup:
@@ -270,23 +290,25 @@ def _keyboard_with_row(query, buttons: list) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def send_photo_safe(bot, chat_id, photo, caption, kb):
+async def send_photo_safe(bot, chat_id, photo, caption, kb, entities=None):
     try:
-        return await bot.send_photo(chat_id, photo, caption=caption, reply_markup=kb)
+        return await bot.send_photo(chat_id, photo, caption=caption, caption_entities=entities, reply_markup=kb)
     except Exception as e:
         if isinstance(photo, (bytes, bytearray)):
             print(f"ارسال مستقیم عکس نشد ({e})؛ تبدیل به JPEG...")
             jpg = await asyncio.to_thread(_to_jpeg_bytes, bytes(photo))
-            return await bot.send_photo(chat_id, jpg, caption=caption, reply_markup=kb)
+            return await bot.send_photo(chat_id, jpg, caption=caption, caption_entities=entities, reply_markup=kb)
         raise
 
 
 async def send_preview(bot, chat_id, d: dict):
     kb = preview_keyboard()
     if d.get("photo"):
-        await send_photo_safe(bot, chat_id, d["photo"], build_caption(d, CAPTION_LIMIT), kb)
+        cap = build_caption(d, CAPTION_LIMIT)
+        await send_photo_safe(bot, chat_id, d["photo"], cap, kb, quote_entities(cap))
     else:
-        await bot.send_message(chat_id, build_caption(d, TEXT_LIMIT), reply_markup=kb)
+        txt = build_caption(d, TEXT_LIMIT)
+        await bot.send_message(chat_id, txt, entities=quote_entities(txt), reply_markup=kb)
 
 
 # ================== مراحل پرسیدن ==================
@@ -596,16 +618,21 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     new_text = None
+    footer_off = 0
     if FOOTER_TEXT and FOOTER_TEXT not in original:
         candidate = f"{original}\n\n{FOOTER_TEXT}" if original else FOOTER_TEXT
         if len(candidate) <= limit:
             new_text = candidate
+            footer_off = _u16(original + "\n\n") if original else 0
 
     new_markup = _markup_with_button(msg.reply_markup) if want_button else None
     if new_text is None and new_markup is None:
         return
 
-    ents = list(entities) if entities else None
+    ents = list(entities) if entities else []
+    if new_text is not None and FOOTER_QUOTE:
+        ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=footer_off, length=_u16(FOOTER_TEXT)))
+    ents = ents or None
     markup = new_markup or msg.reply_markup
     chat_id, mid = msg.chat.id, msg.message_id
     try:
