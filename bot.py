@@ -4,7 +4,7 @@ import time
 import asyncio
 import threading
 from flask import Flask
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
@@ -250,22 +250,23 @@ HELP_TEXT = (
     "بعد پیش‌نمایش میاد و با «📢 ارسال به کانال» منتشر می‌شه.\n\n"
     "/start → باز کردن پنل\n/cancel → لغو پست فعلی"
 )
-PANEL_TEXT = "🎛 پنل پست‌سازی\nیکی رو انتخاب کن:"
+PANEL_TEXT = "🎛 پنل پست‌سازی فعال شد.\nاز دکمه‌های پایین صفحه یکی رو انتخاب کن 👇"
+
+BTN_NEW = "📩 ساخت پست از روی پست"
+BTN_MANUAL = "✍️ ساخت دستی"
+BTN_HELP = "📖 راهنما"
+BTN_CANCEL = "❌ لغو پست فعلی"
+PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL}
 
 
-def panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 ساخت پست از روی پست", callback_data="pn_new")],
-        [InlineKeyboardButton("✍️ ساخت دستی", callback_data="pn_manual")],
-        [
-            InlineKeyboardButton("📖 راهنما", callback_data="pn_help"),
-            InlineKeyboardButton("❌ لغو پست فعلی", callback_data="pn_cancel"),
-        ],
-    ])
-
-
-def back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت به پنل", callback_data="pn_menu")]])
+def panel_keyboard() -> ReplyKeyboardMarkup:
+    """پنل کیبوردی ثابت (دکمه‌های پایین صفحه، کنار جای تایپ)."""
+    return ReplyKeyboardMarkup(
+        [[BTN_NEW], [BTN_MANUAL], [BTN_HELP, BTN_CANCEL]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="یکی از گزینه‌ها رو انتخاب کن...",
+    )
 
 
 def empty_draft() -> dict:
@@ -285,36 +286,27 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     context.user_data.pop("draft", None)
-    await update.message.reply_text("لغو شد ✅\n\n" + PANEL_TEXT, reply_markup=panel_keyboard())
+    await update.message.reply_text("لغو شد ✅", reply_markup=panel_keyboard())
 
 
-async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_allowed(query.from_user.id):
-        return
-    action = query.data[3:]
-
-    if action == "new":
+async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if text == BTN_NEW:
         context.user_data["draft"] = {"step": "await_post"}
-        await query.edit_message_text(
+        await msg.reply_text(
             "📩 پست کانال رو (با عکس و متن) برام فوروارد کن، یا متنش رو بفرست.\n"
             "متن باید خط «مانهوا: ...» داشته باشه.",
-            reply_markup=back_keyboard(),
+            reply_markup=panel_keyboard(),
         )
-    elif action == "manual":
+    elif text == BTN_MANUAL:
         d = empty_draft()
         context.user_data["draft"] = d
-        await query.edit_message_text("✍️ ساخت دستی شروع شد.")
-        await ask_next(context.bot, query.message.chat_id, d)
-    elif action == "help":
-        await query.edit_message_text(HELP_TEXT, reply_markup=back_keyboard())
-    elif action == "cancel":
+        await msg.reply_text("✍️ ساخت دستی شروع شد.", reply_markup=panel_keyboard())
+        await ask_next(context.bot, msg.chat_id, d)
+    elif text == BTN_HELP:
+        await msg.reply_text(HELP_TEXT, reply_markup=panel_keyboard())
+    elif text == BTN_CANCEL:
         context.user_data.pop("draft", None)
-        await query.edit_message_text("لغو شد ✅\n\n" + PANEL_TEXT, reply_markup=panel_keyboard())
-    else:  # menu
-        context.user_data.pop("draft", None)
-        await query.edit_message_text(PANEL_TEXT, reply_markup=panel_keyboard())
+        await msg.reply_text("لغو شد ✅", reply_markup=panel_keyboard())
 
 
 # ================== دریافت پیام‌ها ==================
@@ -325,6 +317,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
     text = (msg.text or msg.caption or "").strip()
     photo = msg.photo[-1].file_id if msg.photo else None
+    if text in PANEL_BUTTONS:
+        await handle_panel_button(msg, context, text)
+        return
+
     d = context.user_data.get("draft")
 
     # مرحله‌ی کاور
@@ -539,7 +535,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cancel", cancel))
 
-    application.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^pn_(new|manual|help|cancel|menu)$"))
     application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^st_(on|end)$"))
     application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub$"))
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
