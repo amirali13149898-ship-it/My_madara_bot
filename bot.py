@@ -10,7 +10,7 @@ import threading
 import requests
 from urllib.parse import urljoin
 from flask import Flask
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
@@ -372,10 +372,20 @@ PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL, BTN_IMPORT, BTN_REFR
 def panel_keyboard() -> ReplyKeyboardMarkup:
     """پنل کیبوردی ثابت (دکمه‌های پایین صفحه، کنار جای تایپ)."""
     return ReplyKeyboardMarkup(
-        [[BTN_NEW], [BTN_MANUAL], [BTN_IMPORT], [BTN_REFRESH], [BTN_HELP, BTN_CANCEL]],
+        [[BTN_NEW, BTN_MANUAL], [BTN_IMPORT, BTN_HELP], [BTN_CANCEL]],
         resize_keyboard=True,
         is_persistent=False,
         input_field_placeholder="یکی از گزینه‌ها رو انتخاب کن...",
+    )
+
+
+def import_keyboard() -> ReplyKeyboardMarkup:
+    """کیبورد مخصوص حالت افزودن مانهواهای قبلی (دکمه‌ی ثبت فقط اینجا میاد)."""
+    return ReplyKeyboardMarkup(
+        [[BTN_REFRESH, BTN_CANCEL]],
+        resize_keyboard=True,
+        is_persistent=False,
+        input_field_placeholder="پست‌های قدیمی رو فوروارد کن...",
     )
 
 
@@ -417,7 +427,7 @@ async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str
         await msg.reply_text(
             "📥 حالت افزودن روشنه.\nپست‌های قدیمی کانال رو (با کپشن) یکی‌یکی برام فوروارد کن.\n"
             "وقتی تموم شد «🔄 ثبت و به‌روزرسانی لیست‌ها» رو بزن.",
-            reply_markup=panel_keyboard())
+            reply_markup=import_keyboard())
         return
     context.user_data.pop("import", None)
     if text == BTN_NEW:
@@ -923,8 +933,7 @@ def build_list_messages(entries: list, title: str) -> list:
             text, ents, count = head(part) + "\n\n", [], 0
         if count:
             text += "\n"
-        if not e.get("plain"):
-            ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text), length=_u16(block)))
+        ents.append(MessageEntity(type=MessageEntity.BLOCKQUOTE, offset=_u16(text), length=_u16(block)))
         text += block
         count += 1
     if not count:
@@ -1122,6 +1131,81 @@ async def do_refresh(msg, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=panel_keyboard())
 
 
+# ================== اصلاح دکمه‌های شیشه‌ای پست‌های قبلی ==================
+_fix_running = False
+
+
+async def _fix_buttons_job(bot, chat_id, a: int, b: int):
+    global _fix_running
+    _fix_running = True
+    ok = same = skipped = 0
+    try:
+        st = get_store()
+        list_ids = set()
+        for key in ("msgs_end", "msgs_on"):
+            try:
+                list_ids.update(json.loads(st.meta.get(key) or "[]"))
+            except Exception:
+                pass
+        for l in (LIST_END_LINK, LIST_ONGOING_LINK):
+            lid = link_to_id(l)
+            if lid:
+                list_ids.add(lid)
+        kb = channel_keyboard()
+        for mid in range(a, b + 1):
+            if mid in list_ids:
+                continue
+            for _try in range(3):
+                try:
+                    await bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=mid, reply_markup=kb)
+                    ok += 1
+                    break
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                except BadRequest as e:
+                    if "not modified" in str(e).lower():
+                        same += 1
+                    else:
+                        skipped += 1
+                    break
+                except Exception as e:
+                    print(f"خطا در ادیت دکمه‌ی پیام {mid}: {e}")
+                    skipped += 1
+                    break
+            await asyncio.sleep(1.2)
+        await bot.send_message(
+            chat_id,
+            f"✅ تموم شد.\nدکمه‌ها اصلاح شد: {ok}\nاز قبل درست بود: {same}\nرد شد (پیام نبود/قابل ادیت نبود): {skipped}",
+            reply_markup=panel_keyboard())
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ خطا: {e}")
+    finally:
+        _fix_running = False
+
+
+async def fixbuttons_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    msg = update.message
+    nums = [int(x) for x in re.findall(r"(?<!\d)(\d+)(?!\d)", " ".join(context.args or []))]
+    if len(nums) < 2:
+        await msg.reply_text(
+            "شماره‌ی اولین و آخرین پست کانال رو بده:\n/fixbuttons 120 480\n\n"
+            "شماره‌ی پیام آخر لینک پسته؛ مثلاً t.me/Manhwa_Hub_News/120 → 120\n"
+            "دکمه‌ی همه‌ی پیام‌های این بازه (به جز پیام لیست‌ها) با آدرس جدید سایت جایگزین میشه.")
+        return
+    a, b = sorted(nums[:2])
+    if b - a > 5000:
+        await msg.reply_text("بازه خیلی بزرگه (حداکثر ۵۰۰۰ پیام تو هر بار).")
+        return
+    if _fix_running:
+        await msg.reply_text("یه اصلاح دیگه هنوز در حال اجراست، صبر کن تموم بشه.")
+        return
+    mins = round((b - a + 1) * 1.3 / 60)
+    await msg.reply_text(f"⏳ شروع شد: پیام {a} تا {b}. حدوداً {mins} دقیقه طول می‌کشه.")
+    context.application.create_task(_fix_buttons_job(context.bot, msg.chat_id, a, b))
+
+
 # ================== اجرا ==================
 def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1129,6 +1213,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("refresh", refresh_cmd))
+    application.add_handler(CommandHandler("fixbuttons", fixbuttons_cmd))
 
     application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^st_(on|end)$"))
     application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub$"))
