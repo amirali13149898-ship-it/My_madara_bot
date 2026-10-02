@@ -10,7 +10,7 @@ import threading
 import requests
 from urllib.parse import urljoin
 from flask import Flask
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, MessageOriginChannel,
     ReplyKeyboardMarkup, Update,
@@ -364,7 +364,7 @@ HELP_TEXT = (
 )
 PANEL_TEXT = "🎛 پنل پست‌سازی فعال شد.\nاز دکمه‌های پایین صفحه یکی رو انتخاب کن 👇"
 
-BTN_NEW = "📩 ساخت پست از روی پست"
+BTN_NEW = "📩 ساخت پست"
 BTN_MANUAL = "✍️ ساخت دستی"
 BTN_HELP = "📖 راهنما"
 BTN_CANCEL = "❌ لغو پست فعلی"
@@ -424,6 +424,7 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
     context.user_data.pop("fix", None)
+    context.user_data.pop("fix_ids", None)
     if text == BTN_REFRESH:
         await do_refresh(msg, context)
         return
@@ -1152,7 +1153,31 @@ async def do_refresh(msg, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=panel_keyboard())
 
 
-# ================== اصلاح دکمه‌ی یک پست قدیمی کانال (با فوروارد) ==================
+# ================== اصلاح دکمه‌ی پست‌های قدیمی کانال (با فوروارد) ==================
+async def set_post_buttons(bot, mid: int):
+    """دکمه‌های پست رو با دو دکمه‌ی استاندارد جایگزین می‌کنه. ('ok'|'same'|'خطا: ...')
+    تایم‌اوت و محدودیت سرعت رو خودش دوباره تلاش می‌کنه."""
+    last = ""
+    for _ in range(4):
+        try:
+            await bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=mid, reply_markup=channel_keyboard())
+            return "ok"
+        except RetryAfter as e:
+            last = str(e)
+            await asyncio.sleep(e.retry_after + 1)
+        except (TimedOut, NetworkError) as e:
+            # ممکنه ادیت انجام شده باشه؛ تلاش دوباره یا موفق میشه یا «not modified» میده
+            last = str(e)
+            await asyncio.sleep(2)
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return "same"
+            return f"خطا: {e}"
+        except Exception as e:
+            return f"خطا: {e}"
+    return f"خطا: {last or 'Timed out'}"
+
+
 async def handle_fix_forward(msg, context: ContextTypes.DEFAULT_TYPE):
     origin = getattr(msg, "forward_origin", None)
     if not isinstance(origin, MessageOriginChannel):
@@ -1162,13 +1187,37 @@ async def handle_fix_forward(msg, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("این پست مال کانال تو نیست؛ فقط پست‌های کانال خودت رو میشه اصلاح کرد.")
         return
     mid = origin.message_id
+    pending = context.user_data.setdefault("fix_ids", [])
+    if mid not in pending:
+        pending.append(mid)
+    rows = [[
+        InlineKeyboardButton("✅ فقط همین پست", callback_data=f"fixok:{mid}"),
+        InlineKeyboardButton("❌ نه", callback_data=f"fixno:{mid}"),
+    ]]
+    if len(pending) > 1:
+        rows.append([InlineKeyboardButton(f"✅ همه‌ی {len(pending)} پستِ فوروارد شده تا الان", callback_data="fixall")])
     await msg.reply_text(
         f"⚠️ از انجام این عملیات اطمینان دارید؟\n"
-        f"دکمه‌های فعلی این پست (شماره {mid}) حذف میشن و دو دکمه‌ی «🌐 بازکردن سایت» و «📚 آرشیو مانهواها» جایگزین میشن.",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ بله، انجام بده", callback_data=f"fixok:{mid}"),
-            InlineKeyboardButton("❌ نه", callback_data="fixno"),
-        ]]))
+        f"دکمه‌های فعلی پست شماره {mid} حذف میشن و دو دکمه‌ی «🌐 بازکردن سایت» و «📚 آرشیو مانهواها» جایگزین میشن.",
+        reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _fix_all_job(bot, chat_id, ids: list):
+    ok = same = 0
+    failed = []
+    for mid in ids:
+        r = await set_post_buttons(bot, mid)
+        if r == "ok":
+            ok += 1
+        elif r == "same":
+            same += 1
+        else:
+            failed.append(f"{mid} ({r[5:60]})")
+        await asyncio.sleep(1.2)
+    text = f"✅ تموم شد.\nاصلاح شد: {ok}\nاز قبل درست بود: {same}"
+    if failed:
+        text += f"\n❌ ناموفق: {len(failed)}\n" + "\n".join(failed[:15])
+    await bot.send_message(chat_id, text)
 
 
 async def fix_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1176,26 +1225,37 @@ async def fix_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(q.from_user.id):
         await q.answer()
         return
-    if q.data == "fixno":
+    pending = context.user_data.setdefault("fix_ids", [])
+    if q.data.startswith("fixno"):
+        mid = int(q.data.split(":")[1]) if ":" in q.data else None
+        if mid in pending:
+            pending.remove(mid)
         await q.answer("لغو شد.")
         await q.edit_message_text("لغو شد ✅")
         return
+    if q.data == "fixall":
+        ids = list(pending)
+        pending.clear()
+        if not ids:
+            await q.answer("موردی نمونده.", show_alert=True)
+            return
+        await q.answer("شروع شد...")
+        await q.edit_message_text(f"⏳ در حال اصلاح {len(ids)} پست... (هر پست حدود ۱ ثانیه)")
+        context.application.create_task(_fix_all_job(context.bot, q.message.chat_id, ids))
+        return
     mid = int(q.data.split(":")[1])
-    try:
-        await context.bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=mid, reply_markup=channel_keyboard())
-        await q.answer("انجام شد ✅")
-        await q.edit_message_text(f"✅ دکمه‌های پست {mid} اصلاح شد. پست بعدی رو بفرست یا «❌ لغو پست فعلی» رو بزن.")
-    except BadRequest as e:
-        if "not modified" in str(e).lower():
-            await q.answer("از قبل درست بود.")
-            await q.edit_message_text(f"✅ دکمه‌های پست {mid} از قبل همین‌ها بود، تغییری لازم نبود.")
-        else:
-            await q.answer("ناموفق بود.", show_alert=True)
-            await q.edit_message_text(
-                f"❌ ادیت پست {mid} نشد:\n{e}\n\nچک کن بات تو کانال ادمین باشه و دسترسی ویرایش پیام‌ها داشته باشه.")
-    except Exception as e:
-        await q.answer("ناموفق بود.", show_alert=True)
-        await q.edit_message_text(f"❌ خطا: {e}")
+    await q.answer("در حال انجام...")
+    r = await set_post_buttons(context.bot, mid)
+    if mid in pending:
+        pending.remove(mid)
+    if r == "ok":
+        await q.edit_message_text(f"✅ دکمه‌های پست {mid} اصلاح شد.")
+    elif r == "same":
+        await q.edit_message_text(f"✅ دکمه‌های پست {mid} از قبل همین‌ها بود، تغییری لازم نبود.")
+    else:
+        await q.edit_message_text(
+            f"❌ ادیت پست {mid} نشد:\n{r[5:]}\n\n"
+            "دوباره فوروارد کن. اگه تکرار شد، چک کن بات تو کانال ادمین باشه و دسترسی ویرایش پیام‌ها داشته باشه.")
 
 
 # ================== اصلاح دکمه‌های شیشه‌ای پست‌های قبلی ==================
@@ -1275,7 +1335,8 @@ async def fixbuttons_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== اجرا ==================
 def build_application() -> Application:
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (Application.builder().token(BOT_TOKEN)
+                   .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).build())
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", start))
     application.add_handler(CommandHandler("cancel", cancel))
@@ -1287,7 +1348,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
     application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno$"))
     application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
-    application.add_handler(CallbackQueryHandler(fix_callback, pattern=r"^fix(ok:\d+|no)$"))
+    application.add_handler(CallbackQueryHandler(fix_callback, pattern=r"^fix(ok:\d+|no(:\d+)?|all)$"))
     application.add_handler(CallbackQueryHandler(setst_callback, pattern=r"^setst:"))
 
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_handler))
