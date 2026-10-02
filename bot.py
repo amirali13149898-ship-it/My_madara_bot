@@ -11,7 +11,10 @@ import requests
 from urllib.parse import urljoin
 from flask import Flask
 from telegram.error import BadRequest, RetryAfter
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, MessageOriginChannel,
+    ReplyKeyboardMarkup, Update,
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters,
@@ -355,6 +358,7 @@ HELP_TEXT = (
     "تو هر دو حالت، ژانرها (اگه تو پست نبود)، تعداد چپترها و وضعیت پخش رو ازت می‌پرسم. "
     "بعد پیش‌نمایش میاد و با «📢 ارسال به کانال» منتشر می‌شه.\n\n"
     "📥 «افزودن مانهواهای قبلی»: پست‌های قدیمی کانال رو یکی‌یکی فوروارد کن تا تو لیست‌ها ثبت بشن؛ آخرش «ثبت و به‌روزرسانی لیست‌ها».\n\n"
+    "🔧 «اصلاح دکمه‌های پست کانال»: یه پست قدیمی کانال رو فوروارد کن؛ بعد از تأیید، دکمه‌هاش حذف و دو دکمه‌ی «بازکردن سایت» و «آرشیو» با آدرس جدید جایگزین میشن.\n\n"
     "پست‌های جدید خودکار تو لیست «پایان یافته» یا «در حال ترجمه» میرن و وقتی یه مانهوا تموم شد از لیست دوم به اولی منتقل می‌شه.\n\n"
     "/start → باز کردن پنل\n/cancel → لغو پست فعلی\n/refresh → به‌روزرسانی لیست‌ها"
 )
@@ -366,13 +370,14 @@ BTN_HELP = "📖 راهنما"
 BTN_CANCEL = "❌ لغو پست فعلی"
 BTN_IMPORT = "📥 افزودن مانهواهای قبلی به لیست"
 BTN_REFRESH = "🔄 ثبت و به‌روزرسانی لیست‌ها"
-PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL, BTN_IMPORT, BTN_REFRESH}
+BTN_FIX = "🔧 اصلاح دکمه‌های پست کانال"
+PANEL_BUTTONS = {BTN_NEW, BTN_MANUAL, BTN_HELP, BTN_CANCEL, BTN_IMPORT, BTN_REFRESH, BTN_FIX}
 
 
 def panel_keyboard() -> ReplyKeyboardMarkup:
     """پنل کیبوردی ثابت (دکمه‌های پایین صفحه، کنار جای تایپ)."""
     return ReplyKeyboardMarkup(
-        [[BTN_NEW, BTN_MANUAL], [BTN_IMPORT, BTN_HELP], [BTN_CANCEL]],
+        [[BTN_NEW, BTN_MANUAL], [BTN_IMPORT, BTN_FIX], [BTN_HELP, BTN_CANCEL]],
         resize_keyboard=True,
         is_persistent=False,
         input_field_placeholder="یکی از گزینه‌ها رو انتخاب کن...",
@@ -418,6 +423,7 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str):
+    context.user_data.pop("fix", None)
     if text == BTN_REFRESH:
         await do_refresh(msg, context)
         return
@@ -430,6 +436,14 @@ async def handle_panel_button(msg, context: ContextTypes.DEFAULT_TYPE, text: str
             reply_markup=import_keyboard())
         return
     context.user_data.pop("import", None)
+    if text == BTN_FIX:
+        context.user_data.pop("draft", None)
+        context.user_data["fix"] = True
+        await msg.reply_text(
+            "🔧 حالت اصلاح دکمه روشنه.\nپستی از کانال که می‌خوای دکمه‌هاش درست بشه رو برام فوروارد کن "
+            "(هر تعداد، یکی‌یکی).\nبرای خروج «❌ لغو پست فعلی» رو بزن.",
+            reply_markup=panel_keyboard())
+        return
     if text == BTN_NEW:
         context.user_data["draft"] = {"step": "await_post"}
         await msg.reply_text(
@@ -459,6 +473,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = msg.photo[-1].file_id if msg.photo else None
     if text in PANEL_BUTTONS:
         await handle_panel_button(msg, context, text)
+        return
+
+    if context.user_data.get("fix"):
+        await handle_fix_forward(msg, context)
+        return
+
+    if not text and not photo:
         return
 
     if context.user_data.get("import") is not None:
@@ -1131,6 +1152,52 @@ async def do_refresh(msg, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=panel_keyboard())
 
 
+# ================== اصلاح دکمه‌ی یک پست قدیمی کانال (با فوروارد) ==================
+async def handle_fix_forward(msg, context: ContextTypes.DEFAULT_TYPE):
+    origin = getattr(msg, "forward_origin", None)
+    if not isinstance(origin, MessageOriginChannel):
+        await msg.reply_text("این پیام از یه کانال فوروارد نشده. یه پست خود کانال رو فوروارد کن.")
+        return
+    if not _is_our_channel(origin.chat):
+        await msg.reply_text("این پست مال کانال تو نیست؛ فقط پست‌های کانال خودت رو میشه اصلاح کرد.")
+        return
+    mid = origin.message_id
+    await msg.reply_text(
+        f"⚠️ از انجام این عملیات اطمینان دارید؟\n"
+        f"دکمه‌های فعلی این پست (شماره {mid}) حذف میشن و دو دکمه‌ی «🌐 بازکردن سایت» و «📚 آرشیو مانهواها» جایگزین میشن.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ بله، انجام بده", callback_data=f"fixok:{mid}"),
+            InlineKeyboardButton("❌ نه", callback_data="fixno"),
+        ]]))
+
+
+async def fix_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_allowed(q.from_user.id):
+        await q.answer()
+        return
+    if q.data == "fixno":
+        await q.answer("لغو شد.")
+        await q.edit_message_text("لغو شد ✅")
+        return
+    mid = int(q.data.split(":")[1])
+    try:
+        await context.bot.edit_message_reply_markup(chat_id=CHANNEL_ID, message_id=mid, reply_markup=channel_keyboard())
+        await q.answer("انجام شد ✅")
+        await q.edit_message_text(f"✅ دکمه‌های پست {mid} اصلاح شد. پست بعدی رو بفرست یا «❌ لغو پست فعلی» رو بزن.")
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            await q.answer("از قبل درست بود.")
+            await q.edit_message_text(f"✅ دکمه‌های پست {mid} از قبل همین‌ها بود، تغییری لازم نبود.")
+        else:
+            await q.answer("ناموفق بود.", show_alert=True)
+            await q.edit_message_text(
+                f"❌ ادیت پست {mid} نشد:\n{e}\n\nچک کن بات تو کانال ادمین باشه و دسترسی ویرایش پیام‌ها داشته باشه.")
+    except Exception as e:
+        await q.answer("ناموفق بود.", show_alert=True)
+        await q.edit_message_text(f"❌ خطا: {e}")
+
+
 # ================== اصلاح دکمه‌های شیشه‌ای پست‌های قبلی ==================
 _fix_running = False
 
@@ -1220,12 +1287,15 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
     application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno$"))
     application.add_handler(CallbackQueryHandler(noop_callback, pattern=r"^noop$"))
+    application.add_handler(CallbackQueryHandler(fix_callback, pattern=r"^fix(ok:\d+|no)$"))
     application.add_handler(CallbackQueryHandler(setst_callback, pattern=r"^setst:"))
 
     application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, channel_post_handler))
     application.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POST, channel_edit_handler))
     application.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND & (filters.TEXT | filters.PHOTO), on_message
+        filters.ChatType.PRIVATE & ~filters.COMMAND
+        & (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.ANIMATION | filters.AUDIO),
+        on_message
     ))
     return application
 
