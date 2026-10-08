@@ -337,8 +337,16 @@ async def ask_next(bot, chat_id, d: dict):
     if d.get("status") is None:
         d["step"] = "status"
         await bot.send_message(chat_id, "وضعیت پخش؟", reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 ادامه دارد", callback_data="st_on"),
+            InlineKeyboardButton("🔄 در حال انتشار", callback_data="st_on"),
             InlineKeyboardButton("🔚 پایان یافته", callback_data="st_end"),
+        ]]))
+        return
+    if d.get("ended") is None:
+        # مانهوا تموم شده ولی ممکنه هنوز همه‌ی چپترها رو ترجمه نکرده باشیم
+        d["step"] = "tr"
+        await bot.send_message(chat_id, "ترجمه‌ی چپترها؟", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔚 همه‌ی چپترها ترجمه شده", callback_data="tr_done"),
+            InlineKeyboardButton("🔄 هنوز ترجمه ادامه داره", callback_data="tr_going"),
         ]]))
         return
     if "photo" not in d:
@@ -555,19 +563,27 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """st_* = وضعیت پخش خود مانهوا | tr_* = وضعیت ترجمه‌ی چپترهای ما (نماد 🔚/🔄 کنار چپتر)"""
     query = update.callback_query
     await query.answer()
     if not is_allowed(query.from_user.id):
         return
     d = context.user_data.get("draft")
-    if not d or d.get("step") != "status":
+    is_tr = query.data.startswith("tr_")
+    if not d or d.get("step") != ("tr" if is_tr else "status"):
         await query.edit_message_text("این مرحله دیگه منقضی شده. پست رو دوباره بفرست.")
         return
-    if query.data == "st_end":
-        d["status"], d["ended"] = "پایان یافته", True
+    if is_tr:
+        d["ended"] = query.data == "tr_done"
+        await query.edit_message_text(
+            "ترجمه: " + ("همه‌ی چپترها ترجمه شده 🔚" if d["ended"] else "در حال ترجمه 🔄") + " ✅")
+    elif query.data == "st_end":
+        d["status"], d["ended"] = "پایان یافته", None   # بعدش می‌پرسه ترجمه تموم شده یا نه
+        await query.edit_message_text(f"وضعیت پخش: {d['status']} ✅")
     else:
-        d["status"], d["ended"] = "ادامه دارد", False
-    await query.edit_message_text(f"وضعیت پخش: {d['status']} ✅")
+        # مانهوا هنوز منتشر میشه => ترجمه‌ی ما هم قطعاً کامل نیست
+        d["status"], d["ended"] = "در حال انتشار", False
+        await query.edit_message_text(f"وضعیت پخش: {d['status']} ✅")
     await ask_next(context.bot, query.message.chat_id, d)
 
 
@@ -926,7 +942,11 @@ def parse_channel_post(text: str):
     if not fa:
         return None
     ended = None
-    m_st = re.search(r"وضعیت\s*پخش\s*[:：]\s*(.+)", text)
+    # نماد کنار چپتر (🔚/🔄) یعنی وضعیت ترجمه‌ی ما و اولویت داره
+    m_sym = re.search(r"chapter\s*\d+\s*_\s*\d+\s*(🔚|🔄)", text, re.I)
+    if m_sym:
+        ended = m_sym.group(1) == "🔚"
+    m_st = None if ended is not None else re.search(r"وضعیت\s*پخش\s*[:：]\s*(.+)", text)
     if m_st:
         s = m_st.group(1)
         if "پایان" in s or "تمام" in s:
@@ -1343,7 +1363,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("refresh", refresh_cmd))
     application.add_handler(CommandHandler("fixbuttons", fixbuttons_cmd))
 
-    application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^st_(on|end)$"))
+    application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^(st_(on|end)|tr_(done|going))$"))
     application.add_handler(CallbackQueryHandler(ask_publish_callback, pattern=r"^pub$"))
     application.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^pubok$"))
     application.add_handler(CallbackQueryHandler(cancel_publish_callback, pattern=r"^pubno$"))
